@@ -1,4 +1,4 @@
-# Real-Time Pricing Calculator
+# Real-Time Asset Analytics Calculator
 
 Turns a live market data feed into metrics as trades happen.
 
