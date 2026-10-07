@@ -13,6 +13,11 @@ It currently also:
   yellow until they're included)
 - checks every aggregated trade ID, ignoring duplicates and fetching any missed trades
 - reconnects automatically when the connection drops, with backoff up to one minute
+- skips malformed messages (if one was a real trade, it's fetched like any missed trade)
+- starts a failed fetch again rather than dropping it, so VWAP never leaves out
+  trades without showing in yellow
+- waits as long as Binance asks when it rate-limits requests, so a long catch-up
+  after an outage doesn't get the IP banned
 
 ## Run
 

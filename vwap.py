@@ -10,8 +10,11 @@ connection ends, it reconnects with backoff and the ID check finds the gap.
 """
 
 import asyncio
+import http.client
 import json
+import math
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -25,9 +28,16 @@ SYMBOL = "XAUUSDT"
 MINUTE_MS = 60 * 1000
 DAY_MS = 24 * 60 * MINUTE_MS
 MAX_RETRY_WAIT_S = 60
+# Trade times past this are treated as corrupt (datetime can't handle times that far off).
+MAX_TRADE_TIME_MS = int(datetime(3000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 
 YELLOW = "\033[33m"
 RESET_COLOR = "\033[0m"
+
+
+def next_retry_wait(wait_s):
+    """The wait after wait_s: 0 (retry straight away), then 5 s, 10 s, 20 s, ... up to MAX_RETRY_WAIT_S."""
+    return min(max(wait_s * 2, 5), MAX_RETRY_WAIT_S)
 
 
 def next_midnight_ms(trade_time_ms):
@@ -148,15 +158,103 @@ async def get_json(path, params):
     """Run fetch_json in a thread so the live stream keeps going, retrying until it works.
 
     Retries once straight away, then waits 5 s, 10 s, 20 s, ... up to MAX_RETRY_WAIT_S.
+    If Binance says we're sending too many requests, waits at least as long as it asks.
     """
     wait_s = 0
     while True:
         try:
             return await run_in_daemon_thread(fetch_json, path, params)
-        except (OSError, ValueError) as error:  # network/HTTP errors are OSErrors; bad JSON is a ValueError
-            print(f"REST request {path} failed ({error}); retrying in {wait_s} s")
+        # Network/HTTP errors are OSErrors, a response cut off midway is an HTTPException,
+        # and bad JSON is a ValueError.
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            delay_s = max(wait_s, rate_limit_wait_s(error))
+            print(f"REST request {path} failed ({error}); retrying in {delay_s} s")
+            await asyncio.sleep(delay_s)
+            wait_s = next_retry_wait(wait_s)
+
+
+def rate_limit_wait_s(error):
+    """Seconds Binance asks us to wait, or 0 if the error isn't a rate limit.
+
+    429 means too many requests. 418 means the IP is banned for a while because 429s
+    were ignored. Both come with a Retry-After header in seconds; retrying sooner
+    makes a ban longer.
+    """
+    if not isinstance(error, urllib.error.HTTPError) or error.code not in (418, 429):
+        return 0
+    try:
+        return int(error.headers["Retry-After"])
+    except (TypeError, KeyError, ValueError):  # header missing or not a number
+        return MAX_RETRY_WAIT_S
+
+
+def is_number(value, minimum):
+    """True if value (a number, or a number sent as text) is finite and at least minimum."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number >= minimum
+
+
+def is_whole_number(value, minimum, maximum):
+    # bool counts as int in Python, so JSON true/false would otherwise get through
+    return isinstance(value, int) and not isinstance(value, bool) and minimum <= value < maximum
+
+
+def check_trade(trade):
+    """Raise ValueError unless an aggTrade (from the stream or REST) has the fields VWAP needs.
+
+    Called before a trade touches any totals or IDs, so a malformed one changes nothing.
+    """
+    if not isinstance(trade, dict):
+        raise ValueError(f"not a JSON object: {trade!r:.200}")
+    if not is_whole_number(trade.get("a"), 0, math.inf):
+        raise ValueError(f"field 'a' missing or not a trade ID: {trade!r:.200}")
+    if not is_whole_number(trade.get("T"), 0, MAX_TRADE_TIME_MS):
+        raise ValueError(f"field 'T' missing or not a possible trade time: {trade!r:.200}")
+    for key in ("p", "q"):
+        if not is_number(trade.get(key), 0) or float(trade[key]) == 0:
+            raise ValueError(f"field {key!r} missing or not a positive number: {trade!r:.200}")
+
+
+def check_candle(candle):
+    """Raise ValueError unless a 1m kline row has the fields VWAP needs.
+
+    A row is [open time, open, high, low, close, volume, close time, quote volume, ...].
+    Volume can be 0 in a minute with no trades.
+    """
+    if not isinstance(candle, list) or len(candle) < 8:
+        raise ValueError(f"not a kline row: {candle!r:.200}")
+    if not (is_whole_number(candle[0], 0, MAX_TRADE_TIME_MS) and is_whole_number(candle[6], 0, MAX_TRADE_TIME_MS)):
+        raise ValueError(f"kline open or close time isn't a possible time: {candle!r:.200}")
+    if not (is_number(candle[5], 0) and is_number(candle[7], 0)):
+        raise ValueError(f"kline volume or quote volume isn't a number: {candle!r:.200}")
+
+
+def check_list(response, path):
+    """Raise ValueError unless a REST response is a list (Binance sends errors as an object)."""
+    if not isinstance(response, list):
+        raise ValueError(f"{path} returned {response!r:.200} instead of a list")
+
+
+async def retry_on_error(name, function, *args):
+    """Run a background fetch, starting it again if it fails, until it finishes.
+
+    get_json already retries network errors; this catches anything else (such as a
+    response in an unexpected shape). Without it the fetch would stop silently and
+    VWAP would leave out its trades while no longer being shown in yellow.
+    Starting again is safe: backfill only adds its totals once it has finished, and
+    fetch_gap only adds trades it can still claim from the missing set.
+    """
+    wait_s = 0
+    while True:
+        try:
+            return await function(*args)
+        except Exception as error:
+            print(f"{name} failed ({type(error).__name__}: {error}); starting it again in {wait_s} s")
             await asyncio.sleep(wait_s)
-            wait_s = min(max(wait_s * 2, 5), MAX_RETRY_WAIT_S)
+            wait_s = next_retry_wait(wait_s)
 
 
 async def fetch_earlier_trades(session_start_ms, first_trade):
@@ -177,7 +275,9 @@ async def fetch_earlier_trades(session_start_ms, first_trade):
             "symbol": SYMBOL, "interval": "1m", "limit": 1500,
             "startTime": session_start_ms, "endTime": minute_start_ms - 1,
         })
+        check_list(candles, "/fapi/v1/klines")
         for candle in candles:
+            check_candle(candle)
             open_time_ms, close_time_ms = candle[0], candle[6]
             if open_time_ms < session_start_ms or close_time_ms >= minute_start_ms:
                 continue  # outside the session, or the still-open candle
@@ -189,11 +289,13 @@ async def fetch_earlier_trades(session_start_ms, first_trade):
     params = {"symbol": SYMBOL, "startTime": minute_start_ms, "limit": 1000}
     while True:
         trades = await get_json("/fapi/v1/aggTrades", params)
+        check_list(trades, "/fapi/v1/aggTrades")
         if not trades:
             # REST hasn't caught up with the stream yet; ask again for the same page.
             await asyncio.sleep(1)
             continue
         for trade in trades:
+            check_trade(trade)
             if trade["a"] >= first_live_id:
                 return pv, volume, candle_count, trade_count
             price = float(trade["p"])
@@ -231,10 +333,12 @@ async def fetch_gap(tracker, checker, first_id, last_id):
     from_id = first_id
     while from_id <= last_id:
         trades = await get_json("/fapi/v1/aggTrades", {"symbol": SYMBOL, "fromId": from_id, "limit": 1000})
+        check_list(trades, "/fapi/v1/aggTrades")
         if not trades:
             await asyncio.sleep(1)
             continue
         for trade in trades:
+            check_trade(trade)  # before claiming, so a bad row can't claim an ID without adding it
             if trade["a"] > last_id:
                 break
             if not checker.claim(trade["a"]):
@@ -279,8 +383,8 @@ class LiveVwap:
         self.backfill_task = None
         self.fetch_tasks = set()  # keeps running fetch tasks referenced until they finish
 
-    def start_task(self, coroutine):
-        task = asyncio.create_task(coroutine)
+    def start_task(self, name, function, *args):
+        task = asyncio.create_task(retry_on_error(name, function, *args))
         self.fetch_tasks.add(task)
         task.add_done_callback(self.fetch_tasks.discard)
         return task
@@ -307,11 +411,11 @@ class LiveVwap:
 
         # The first live trade sets the session, so the startup fetch can start now.
         if self.backfill_task is None:
-            self.backfill_task = self.start_task(backfill(self.tracker, trade))
+            self.backfill_task = self.start_task("Fetching earlier trades", backfill, self.tracker, trade)
         if gap is not None:
             first_id, last_id = gap
             print(f"Gap: {last_id - first_id + 1} trades missing (IDs {first_id}-{last_id}); fetching from REST")
-            self.start_task(fetch_gap(self.tracker, self.checker, first_id, last_id))
+            self.start_task(f"Fetching gap {first_id}-{last_id}", fetch_gap, self.tracker, self.checker, first_id, last_id)
 
         # Yellow means VWAP doesn't include every trade yet.
         vwap_text = format_vwap(self.tracker.vwap)
@@ -337,7 +441,14 @@ class LiveVwap:
                 async with websockets.connect(self.stream_url) as ws:
                     async for message in ws:
                         wait_s = 0
-                        self.handle_trade(json.loads(message))
+                        try:
+                            trade = json.loads(message)
+                            check_trade(trade)
+                        except ValueError as error:  # bad JSON is a ValueError too
+                            # If it was a real trade, its ID shows up as a gap and is fetched from REST.
+                            print(f"Warning: skipped a message that isn't a valid trade ({error})")
+                            continue
+                        self.handle_trade(trade)
                 # A normal close (e.g. Binance's 24 hour limit) ends the loop without an error.
                 print("Binance closed the connection, reconnecting")
             except websockets.exceptions.ConnectionClosedError as error:
@@ -350,7 +461,7 @@ class LiveVwap:
             if wait_s > 0:
                 print(f"Retrying in {wait_s} s")
             await self.sleep(wait_s)
-            wait_s = min(max(wait_s * 2, 5), MAX_RETRY_WAIT_S)
+            wait_s = next_retry_wait(wait_s)
 
 
 if __name__ == "__main__":

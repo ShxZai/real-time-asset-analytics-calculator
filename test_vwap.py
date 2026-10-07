@@ -8,10 +8,13 @@ compare our totals with its official 1 minute candles (each takes up to ~1 minut
 
 import asyncio
 import contextlib
+import http.client
 import json
 import math
+import urllib.error
 from http import HTTPStatus
 
+import pytest
 import websockets
 
 import vwap
@@ -37,10 +40,26 @@ def fake_rest(trades):
     return get_json
 
 
+def fail_first(get_json, request_kind, bad_response):
+    """Wrap a fake get_json so the first aggTrades request of one kind gets bad_response.
+
+    request_kind is "startTime" (the startup fetch) or "fromId" (a gap fetch).
+    """
+    failed = []
+
+    async def wrapped(path, params):
+        if path == "/fapi/v1/aggTrades" and request_kind in params and not failed:
+            failed.append(True)
+            return bad_response
+        return await get_json(path, params)
+    return wrapped
+
+
 class FakeBinance:
     """A local WebSocket server that plays out a script of connections.
 
-    connections: one list of trades per accepted connection. Every connection but the
+    connections: one list of trades per accepted connection; a string is sent as-is
+    (for malformed messages). Every connection but the
     last closes normally after sending its trades, like Binance's 24 hour close.
     refuse_first: how many connection attempts get their handshake refused (HTTP 403).
     """
@@ -61,7 +80,7 @@ class FakeBinance:
         trades = self.connections[self.accepted]
         self.accepted += 1
         for trade in trades:
-            await ws.send(json.dumps(trade))
+            await ws.send(trade if isinstance(trade, str) else json.dumps(trade))
         if self.accepted < len(self.connections):
             return  # returning closes the connection normally
         await ws.wait_closed()  # keep the last connection open until the server shuts down
@@ -176,6 +195,105 @@ def test_gap_across_midnight_drops_old_day_and_keeps_new_day(monkeypatch):
     assert live.tracker.next_reset_ms == MIDNIGHT_MS + vwap.DAY_MS  # in the new session
     assert live.tracker.cumulative_volume == 3  # trades 3, 4, 5 only
     assert math.isclose(live.tracker.vwap, 5)  # (4 + 5 + 6) / 3; 4 would mean 1 and 2 leaked in
+
+
+# ---------- bad messages and failed fetches (offline, fake server + fake REST) ----------
+
+def all_counted(live):
+    return not live.checker.missing_ids and not live.fetch_tasks
+
+
+def test_bad_stream_messages_are_skipped_without_reconnecting(monkeypatch):
+    t = MIDNIGHT_MS + 60_000
+    trades = [make_trade(i, 100 + i, t + i) for i in range(3)]
+    monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
+    # Trade 1 arrives broken (price "nan"), so it's skipped and then fetched as a gap.
+    fake = FakeBinance([[trades[0], "not json", ["a", "list"], {**trades[1], "p": "nan"}, trades[2]]])
+
+    live, waits = asyncio.run(play(fake, lambda live: live.checker.highest_id == 2 and all_counted(live)))
+
+    assert fake.accepted == 1 and waits == []  # the connection was never dropped
+    assert live.tracker.cumulative_volume == 3
+    assert math.isclose(live.tracker.vwap, 101)  # (100 + 101 + 102) / 3
+
+
+def test_failed_startup_fetch_is_started_again_not_dropped(monkeypatch, capsys):
+    t = MIDNIGHT_MS + 60_000
+    trades = [make_trade(i, 100 + i, t + i) for i in range(4)]
+    # The first startup aggTrades request gets an error object instead of a list of trades.
+    error = {"code": -1003, "msg": "Too many requests"}
+    monkeypatch.setattr(vwap, "get_json", fail_first(fake_rest(trades), "startTime", error))
+    fake = FakeBinance([[trades[3]]])  # starts mid-session: trades 0-2 come from the fetch
+
+    live, _ = asyncio.run(play(fake, lambda live: live.backfill_task is not None and all_counted(live)))
+
+    assert "Fetching earlier trades failed" in capsys.readouterr().out
+    assert live.tracker.cumulative_volume == 4
+    assert math.isclose(live.tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
+
+
+def test_failed_gap_fetch_is_started_again_without_counting_twice(monkeypatch):
+    t = MIDNIGHT_MS + 60_000
+    trades = [make_trade(i, 100 + i, t + i) for i in range(4)]
+    # The first gap response has a good trade 1 then a broken trade 2, so the fetch
+    # fails after adding trade 1; starting again must not add trade 1 a second time.
+    bad_page = [trades[1], {**trades[2], "q": "abc"}]
+    monkeypatch.setattr(vwap, "get_json", fail_first(fake_rest(trades), "fromId", bad_page))
+    fake = FakeBinance([[trades[0], trades[3]]])  # gap 1-2
+
+    live, _ = asyncio.run(play(fake, lambda live: live.checker.highest_id == 3 and all_counted(live)))
+
+    assert live.tracker.cumulative_volume == 4
+    assert math.isclose(live.tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
+
+
+# ---------- checking data and REST retries (offline) ----------
+
+def test_check_trade_rejects_values_that_would_break_vwap():
+    good = make_trade(7, 100, MIDNIGHT_MS)
+    vwap.check_trade(good)
+    bad_fields = [{"a": True}, {"a": -1}, {"a": 7.0}, {"T": -5}, {"T": vwap.MAX_TRADE_TIME_MS},
+                  {"p": "0"}, {"p": "inf"}, {"q": "-1"}, {"q": None}]
+    for bad in bad_fields:
+        with pytest.raises(ValueError):
+            vwap.check_trade({**good, **bad})
+
+
+def test_check_candle_allows_quiet_minutes_but_not_broken_numbers():
+    candle = [MIDNIGHT_MS, "1", "1", "1", "1", "0", MIDNIGHT_MS + 59_999, "0", 0]  # no trades that minute
+    vwap.check_candle(candle)
+    for index, bad in [(5, "nan"), (7, "abc"), (6, None)]:
+        with pytest.raises(ValueError):
+            vwap.check_candle(candle[:index] + [bad] + candle[index + 1:])
+    with pytest.raises(ValueError):
+        vwap.check_candle({"code": -1121, "msg": "Invalid symbol."})
+
+
+def http_error(code, retry_after=None):
+    headers = http.client.HTTPMessage()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError("https://fapi.binance.com", code, "error", headers, None)
+
+
+def test_get_json_waits_as_long_as_binance_asks_when_rate_limited(monkeypatch):
+    errors = [http_error(429, "30"), http_error(418, None), http.client.IncompleteRead(b""), http_error(500)]
+
+    def fetch_json(path, params):
+        if errors:
+            raise errors.pop(0)
+        return [1, 2]
+    monkeypatch.setattr(vwap, "fetch_json", fetch_json)
+    waits = []
+
+    async def record_sleep(seconds):
+        waits.append(seconds)
+    monkeypatch.setattr(vwap.asyncio, "sleep", record_sleep)
+
+    assert asyncio.run(vwap.get_json("/fapi/v1/aggTrades", {})) == [1, 2]
+    # 429 says 30 s; 418 without a header waits the maximum; a cut-off response is
+    # retried like a network error; a plain 500 goes back to the normal backoff.
+    assert waits == [30, vwap.MAX_RETRY_WAIT_S, 10, 20]
 
 
 # ---------- live tests (real Binance) ----------
