@@ -29,7 +29,7 @@ def make_trade(trade_id, price, trade_time_ms, quantity=1):
 
 def fake_rest(trades):
     """A stand-in for vwap.get_json that serves these trades as if they were Binance's history."""
-    async def get_json(path, params):
+    async def get_json(path, params, log):
         if path == "/fapi/v1/klines":
             return []  # no earlier candles: every test session starts in its first minute
         if "fromId" in params:
@@ -47,11 +47,11 @@ def fail_first(get_json, request_kind, bad_response):
     """
     failed = []
 
-    async def wrapped(path, params):
+    async def wrapped(path, params, log):
         if path == "/fapi/v1/aggTrades" and request_kind in params and not failed:
             failed.append(True)
             return bad_response
-        return await get_json(path, params)
+        return await get_json(path, params, log)
     return wrapped
 
 
@@ -174,6 +174,8 @@ def test_refused_handshake_backs_off_then_connects(monkeypatch):
     assert fake.attempts == 4
     assert waits == [0, 5, 10]
     assert live.tracker.cumulative_volume == 3
+    assert sum("refused" in e["message"] for e in live.events) == 3
+    assert live.connection["state"] == "connected"
 
 
 # ---------- gap across midnight (offline, fake server + fake REST) ----------
@@ -217,7 +219,7 @@ def test_bad_stream_messages_are_skipped_without_reconnecting(monkeypatch):
     assert math.isclose(live.tracker.vwap, 101)  # (100 + 101 + 102) / 3
 
 
-def test_failed_startup_fetch_is_started_again_not_dropped(monkeypatch, capsys):
+def test_failed_startup_fetch_is_started_again_not_dropped(monkeypatch):
     t = MIDNIGHT_MS + 60_000
     trades = [make_trade(i, 100 + i, t + i) for i in range(4)]
     # The first startup aggTrades request gets an error object instead of a list of trades.
@@ -227,7 +229,7 @@ def test_failed_startup_fetch_is_started_again_not_dropped(monkeypatch, capsys):
 
     live, _ = asyncio.run(play(fake, lambda live: live.backfill_task is not None and all_counted(live)))
 
-    assert "Fetching earlier trades failed" in capsys.readouterr().out
+    assert any("Fetching earlier trades failed" in e["message"] for e in live.events)
     assert live.tracker.cumulative_volume == 4
     assert math.isclose(live.tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
 
@@ -245,6 +247,50 @@ def test_failed_gap_fetch_is_started_again_without_counting_twice(monkeypatch):
 
     assert live.tracker.cumulative_volume == 4
     assert math.isclose(live.tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
+
+
+# ---------- state and events for a display (offline) ----------
+
+def test_snapshot_before_the_first_trade_is_empty_and_waiting():
+    snapshot = vwap.LiveVwap().snapshot()
+    assert snapshot["history"] == "waiting"
+    assert snapshot["vwap"] is None and snapshot["last_trade"] is None and snapshot["session_start_ms"] is None
+
+
+def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
+    t = MIDNIGHT_MS + 60_000
+    trades = [make_trade(i, 100 + i, t + i) for i in range(4)]
+    monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
+    fake = FakeBinance([[trades[0]], [trades[3]]])  # gap 1-2 across a reconnect
+
+    live, _ = asyncio.run(play(fake, lambda live: live.checker.highest_id == 3 and all_counted(live)))
+    snapshot = live.snapshot()
+
+    assert snapshot["connection"]["state"] == "connected"
+    assert snapshot["history"] == "done" and snapshot["missing_count"] == 0
+    assert snapshot["session_start_ms"] == MIDNIGHT_MS
+    assert snapshot["last_trade"]["price"] == 103 and snapshot["last_trade"]["time_ms"] == t + 3
+    assert math.isclose(snapshot["vwap"], 101.5)  # (100 + 101 + 102 + 103) / 4
+    messages = [e["message"] for e in snapshot["events"]]
+    assert any(m.startswith("Gap: 2 trades missing") for m in messages)
+    assert any(m.startswith("Gap 1-2 filled") for m in messages)
+    ids = [e["id"] for e in snapshot["events"]]
+    assert ids == sorted(ids) and len(set(ids)) == len(ids)
+
+    snapshot["connection"]["state"] = "changed"
+    snapshot["events"].clear()
+    assert live.connection["state"] == "connected" and live.events  # the engine wasn't touched
+
+
+def test_event_list_keeps_only_the_latest_events():
+    live = vwap.LiveVwap()
+    seen = []
+    live.on_event = seen.append
+    for i in range(vwap.MAX_EVENTS + 100):
+        live.log("info", f"event {i}")
+    assert len(seen) == vwap.MAX_EVENTS + 100  # the callback sees every event
+    assert len(live.events) == vwap.MAX_EVENTS
+    assert live.events[0]["id"] == 100  # the oldest 100 were dropped
 
 
 # ---------- checking data and REST retries (offline) ----------
@@ -290,7 +336,9 @@ def test_get_json_waits_as_long_as_binance_asks_when_rate_limited(monkeypatch):
         waits.append(seconds)
     monkeypatch.setattr(vwap.asyncio, "sleep", record_sleep)
 
-    assert asyncio.run(vwap.get_json("/fapi/v1/aggTrades", {})) == [1, 2]
+    logged = []
+    assert asyncio.run(vwap.get_json("/fapi/v1/aggTrades", {}, lambda *event: logged.append(event))) == [1, 2]
+    assert len(logged) == 4 and all(level == "warning" for level, _ in logged)
     # 429 says 30 s; 418 without a header waits the maximum; a cut-off response is
     # retried like a network error; a plain 500 goes back to the normal backoff.
     assert waits == [30, vwap.MAX_RETRY_WAIT_S, 10, 20]

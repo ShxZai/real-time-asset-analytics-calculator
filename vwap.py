@@ -1,4 +1,7 @@
-"""Live VWAP for Binance XAUUSDT futures, printed to the terminal.
+"""Live VWAP for Binance XAUUSDT futures.
+
+The engine (LiveVwap) keeps its state and a list of events instead of printing, so a
+display can follow it. Running this file shows it in the terminal.
 
 VWAP resets at 00:00 UTC each day. When the program starts mid-session, it fetches
 the session's earlier trades from the REST API (1m candles, then aggTrades up to the
@@ -14,9 +17,11 @@ import http.client
 import json
 import math
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import websockets
@@ -30,6 +35,7 @@ DAY_MS = 24 * 60 * MINUTE_MS
 MAX_RETRY_WAIT_S = 60
 # Trade times past this are treated as corrupt (datetime can't handle times that far off).
 MAX_TRADE_TIME_MS = int(datetime(3000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+MAX_EVENTS = 500  # the debug console keeps this many of the latest events
 
 YELLOW = "\033[33m"
 RESET_COLOR = "\033[0m"
@@ -38,6 +44,11 @@ RESET_COLOR = "\033[0m"
 def next_retry_wait(wait_s):
     """The wait after wait_s: 0 (retry straight away), then 5 s, 10 s, 20 s, ... up to MAX_RETRY_WAIT_S."""
     return min(max(wait_s * 2, 5), MAX_RETRY_WAIT_S)
+
+
+def now_ms():
+    """The PC clock in milliseconds (for when the program noticed something, not trade times)."""
+    return int(time.time() * 1000)
 
 
 def next_midnight_ms(trade_time_ms):
@@ -154,8 +165,10 @@ def run_in_daemon_thread(function, *args):
     return future
 
 
-async def get_json(path, params):
+async def get_json(path, params, log):
     """Run fetch_json in a thread so the live stream keeps going, retrying until it works.
+
+    log(level, message) records each failure (see LiveVwap.log).
 
     Retries once straight away, then waits 5 s, 10 s, 20 s, ... up to MAX_RETRY_WAIT_S.
     If Binance says we're sending too many requests, waits at least as long as it asks.
@@ -168,7 +181,7 @@ async def get_json(path, params):
         # and bad JSON is a ValueError.
         except (OSError, http.client.HTTPException, ValueError) as error:
             delay_s = max(wait_s, rate_limit_wait_s(error))
-            print(f"REST request {path} failed ({error}); retrying in {delay_s} s")
+            log("warning", f"REST request {path} failed ({error}); retrying in {delay_s} s")
             await asyncio.sleep(delay_s)
             wait_s = next_retry_wait(wait_s)
 
@@ -238,7 +251,7 @@ def check_list(response, path):
         raise ValueError(f"{path} returned {response!r:.200} instead of a list")
 
 
-async def retry_on_error(name, function, *args):
+async def retry_on_error(name, log, function, *args):
     """Run a background fetch, starting it again if it fails, until it finishes.
 
     get_json already retries network errors; this catches anything else (such as a
@@ -252,12 +265,12 @@ async def retry_on_error(name, function, *args):
         try:
             return await function(*args)
         except Exception as error:
-            print(f"{name} failed ({type(error).__name__}: {error}); starting it again in {wait_s} s")
+            log("warning", f"{name} failed ({type(error).__name__}: {error}); starting it again in {wait_s} s")
             await asyncio.sleep(wait_s)
             wait_s = next_retry_wait(wait_s)
 
 
-async def fetch_earlier_trades(session_start_ms, first_trade):
+async def fetch_earlier_trades(session_start_ms, first_trade, log):
     """Sum the session's trades from before the first live trade.
 
     1m candles cover the session start up to the start of the first live trade's
@@ -274,7 +287,7 @@ async def fetch_earlier_trades(session_start_ms, first_trade):
         candles = await get_json("/fapi/v1/klines", {
             "symbol": SYMBOL, "interval": "1m", "limit": 1500,
             "startTime": session_start_ms, "endTime": minute_start_ms - 1,
-        })
+        }, log)
         check_list(candles, "/fapi/v1/klines")
         for candle in candles:
             check_candle(candle)
@@ -288,7 +301,7 @@ async def fetch_earlier_trades(session_start_ms, first_trade):
     trade_count = 0
     params = {"symbol": SYMBOL, "startTime": minute_start_ms, "limit": 1000}
     while True:
-        trades = await get_json("/fapi/v1/aggTrades", params)
+        trades = await get_json("/fapi/v1/aggTrades", params, log)
         check_list(trades, "/fapi/v1/aggTrades")
         if not trades:
             # REST hasn't caught up with the stream yet; ask again for the same page.
@@ -306,23 +319,22 @@ async def fetch_earlier_trades(session_start_ms, first_trade):
         params = {"symbol": SYMBOL, "fromId": trades[-1]["a"] + 1, "limit": 1000}
 
 
-async def backfill(tracker, first_trade):
+async def backfill(tracker, first_trade, log):
     """Fetch the session's earlier trades and add them to the tracker's totals."""
     session_reset_ms = tracker.next_reset_ms
     session_start_ms = session_reset_ms - DAY_MS
-    print(f"Fetching earlier trades since {format_time(session_start_ms)} UTC "
-          f"(VWAP shown in yellow until done)")
-    pv, volume, candle_count, trade_count = await fetch_earlier_trades(session_start_ms, first_trade)
+    log("info", f"Fetching earlier trades since {format_time(session_start_ms)} UTC")
+    pv, volume, candle_count, trade_count = await fetch_earlier_trades(session_start_ms, first_trade, log)
 
     if tracker.next_reset_ms != session_reset_ms:
-        print("A new session started before the fetch finished; discarding the fetched trades")
+        log("info", "A new session started before the fetch finished; discarding the fetched trades")
         return
     tracker.add_totals(pv, volume)
-    print(f"Added {candle_count} one-minute candles and {trade_count} trades. "
-          f"Full-session VWAP {format_vwap(tracker.vwap)}")
+    log("info", f"Added {candle_count} one-minute candles and {trade_count} trades. "
+                f"Full-session VWAP {format_vwap(tracker.vwap)}")
 
 
-async def fetch_gap(tracker, checker, first_id, last_id):
+async def fetch_gap(tracker, checker, first_id, last_id, log):
     """Fetch the trades in one gap from REST and add those still missing to the totals.
 
     A fetched trade is only counted if its ID is still in the missing set, so a trade
@@ -332,7 +344,7 @@ async def fetch_gap(tracker, checker, first_id, last_id):
     added = dropped = 0
     from_id = first_id
     while from_id <= last_id:
-        trades = await get_json("/fapi/v1/aggTrades", {"symbol": SYMBOL, "fromId": from_id, "limit": 1000})
+        trades = await get_json("/fapi/v1/aggTrades", {"symbol": SYMBOL, "fromId": from_id, "limit": 1000}, log)
         check_list(trades, "/fapi/v1/aggTrades")
         if not trades:
             await asyncio.sleep(1)
@@ -353,10 +365,10 @@ async def fetch_gap(tracker, checker, first_id, last_id):
 
     # IDs that REST never returned don't exist; stop waiting for them.
     never_found = [i for i in range(first_id, last_id + 1) if checker.claim(i)]
-    print(f"Gap {first_id}-{last_id} filled: {added} trades added, "
-          f"{dropped} from the previous session dropped. VWAP {format_vwap(tracker.vwap)}")
+    log("info", f"Gap {first_id}-{last_id} filled: {added} trades added, "
+                f"{dropped} from the previous session dropped. VWAP {format_vwap(tracker.vwap)}")
     if never_found:
-        print(f"Warning: Binance has no trades for {len(never_found)} IDs in that gap")
+        log("warning", f"Binance has no trades for {len(never_found)} IDs in that gap")
 
 
 def format_vwap(vwap):
@@ -369,22 +381,83 @@ def format_time(time_ms):
 
 
 class LiveVwap:
-    """The live feed: ID checks, VWAP updates, background fetches and reconnecting.
+    """The live engine: ID checks, VWAP updates, background fetches and reconnecting.
+
+    It doesn't print or draw anything. A display follows it in two ways:
+    snapshot() returns a copy of everything there is to show, and the callbacks
+    on_event(event) and on_trade() are called as things happen.
 
     The tracker and checker live here, not inside the connection, so the totals,
     reset time, highest ID and missing IDs all survive a reconnect.
     """
 
-    def __init__(self, stream_url=STREAM_URL):
+    def __init__(self, stream_url=STREAM_URL, on_event=None, on_trade=None):
         self.stream_url = stream_url  # tests point this at a fake server
         self.sleep = asyncio.sleep  # tests swap this to record reconnect waits
+        self.on_event = on_event  # called with each new event
+        self.on_trade = on_trade  # called after each new live trade is counted
         self.tracker = VwapTracker()
         self.checker = TradeIdChecker()
         self.backfill_task = None
         self.fetch_tasks = set()  # keeps running fetch tasks referenced until they finish
+        self.last_trade = None  # the latest new live trade: price, quantity, time_ms, received_ms
+        self.connection = {"state": "connecting", "message": "Starting", "retry_at_ms": None}
+        self.events = deque(maxlen=MAX_EVENTS)
+        self.next_event_id = 0
+
+    def log(self, level, message):
+        """Record an event ("info" or "warning") for the debug console.
+
+        time_ms is the PC clock: when the program noticed it, not when Binance traded.
+        IDs go up by 1, so a display can tell which events it hasn't shown yet.
+        """
+        event = {"id": self.next_event_id, "time_ms": now_ms(), "level": level, "message": message}
+        self.next_event_id += 1
+        self.events.append(event)
+        if self.on_event:
+            self.on_event(event)
+
+    def set_connection(self, state, level, message):
+        """Change the connection state and record it as an event.
+
+        States: "connecting", "connected", "closed" (Binance ended it normally),
+        "dropped", "refused" and "unreachable".
+        """
+        self.connection = {"state": state, "message": message, "retry_at_ms": None}
+        self.log(level, message)
+
+    def history_state(self):
+        """Return "waiting" before the first trade, "fetching" during the startup fetch, then "done"."""
+        if self.backfill_task is None:
+            return "waiting"
+        return "done" if self.backfill_task.done() else "fetching"
+
+    def is_complete(self):
+        """True if VWAP includes every trade so far: startup fetch done and no IDs missing."""
+        return self.history_state() == "done" and not self.checker.missing_ids
+
+    def snapshot(self):
+        """Everything a display needs, as plain values copied in one go.
+
+        There's no await in here, so the engine can't change anything halfway through:
+        a display never sees a new VWAP next to an old price.
+        """
+        session_start_ms = None
+        if self.tracker.next_reset_ms is not None:
+            session_start_ms = self.tracker.next_reset_ms - DAY_MS
+        return {
+            "symbol": SYMBOL,
+            "connection": dict(self.connection),
+            "history": self.history_state(),
+            "missing_count": len(self.checker.missing_ids),
+            "session_start_ms": session_start_ms,
+            "last_trade": dict(self.last_trade) if self.last_trade else None,
+            "vwap": self.tracker.vwap,
+            "events": list(self.events),  # events are never changed after they're made
+        }
 
     def start_task(self, name, function, *args):
-        task = asyncio.create_task(retry_on_error(name, function, *args))
+        task = asyncio.create_task(retry_on_error(name, self.log, function, *args))
         self.fetch_tasks.add(task)
         task.add_done_callback(self.fetch_tasks.discard)
         return task
@@ -397,35 +470,30 @@ class LiveVwap:
 
         kind, gap = self.checker.check(trade["a"])
         if kind == "duplicate":
-            print(f"Warning: duplicate trade {trade['a']} ignored")
+            self.log("warning", f"Duplicate trade {trade['a']} ignored")
             return
         if kind == "late":
             if self.tracker.in_session(trade_time_ms):
                 self.tracker.add_totals(price * quantity, quantity)
-                print(f"Late trade {trade['a']} arrived and was added")
+                self.log("info", f"Late trade {trade['a']} arrived and was added")
             return
 
         if self.tracker.add_trade(price, quantity, trade_time_ms):
             session_date = datetime.fromtimestamp(trade_time_ms / 1000, tz=timezone.utc).date()
-            print(f"--- New session: {session_date} (UTC) ---")
+            self.log("info", f"New session: {session_date} (UTC)")
+        self.last_trade = {"price": price, "quantity": quantity, "time_ms": trade_time_ms, "received_ms": now_ms()}
 
         # The first live trade sets the session, so the startup fetch can start now.
         if self.backfill_task is None:
-            self.backfill_task = self.start_task("Fetching earlier trades", backfill, self.tracker, trade)
+            self.backfill_task = self.start_task("Fetching earlier trades", backfill, self.tracker, trade, self.log)
         if gap is not None:
             first_id, last_id = gap
-            print(f"Gap: {last_id - first_id + 1} trades missing (IDs {first_id}-{last_id}); fetching from REST")
-            self.start_task(f"Fetching gap {first_id}-{last_id}", fetch_gap, self.tracker, self.checker, first_id, last_id)
+            self.log("info", f"Gap: {last_id - first_id + 1} trades missing (IDs {first_id}-{last_id}); fetching from REST")
+            self.start_task(f"Fetching gap {first_id}-{last_id}", fetch_gap,
+                            self.tracker, self.checker, first_id, last_id, self.log)
 
-        # Yellow means VWAP doesn't include every trade yet.
-        vwap_text = format_vwap(self.tracker.vwap)
-        if not self.backfill_task.done() or self.checker.missing_ids:
-            vwap_text = f"{YELLOW}{vwap_text}{RESET_COLOR}"
-        print(
-            f"{format_time(trade_time_ms)} UTC  "
-            f"price {price:.2f}  qty {quantity:g}  "
-            f"VWAP {vwap_text}"
-        )
+        if self.on_trade:
+            self.on_trade()
 
     async def run(self):
         """Connect and receive trades forever, reconnecting with backoff when the connection ends.
@@ -433,12 +501,12 @@ class LiveVwap:
         Retries straight away, then waits 5 s, 10 s, 20 s, ... up to MAX_RETRY_WAIT_S.
         The wait goes back to zero once a connection delivers a trade.
         """
-        print(f"VWAP: {format_vwap(self.tracker.vwap)} (waiting for the first trade)")
         wait_s = 0
         while True:
-            print(f"Connecting to {self.stream_url}")
+            self.set_connection("connecting", "info", f"Connecting to {self.stream_url}")
             try:
                 async with websockets.connect(self.stream_url) as ws:
+                    self.set_connection("connected", "info", "Connected")
                     async for message in ws:
                         wait_s = 0
                         try:
@@ -446,26 +514,48 @@ class LiveVwap:
                             check_trade(trade)
                         except ValueError as error:  # bad JSON is a ValueError too
                             # If it was a real trade, its ID shows up as a gap and is fetched from REST.
-                            print(f"Warning: skipped a message that isn't a valid trade ({error})")
+                            self.log("warning", f"Skipped a message that isn't a valid trade ({error})")
                             continue
                         self.handle_trade(trade)
                 # A normal close (e.g. Binance's 24 hour limit) ends the loop without an error.
-                print("Binance closed the connection, reconnecting")
+                self.set_connection("closed", "info", "Binance closed the connection, reconnecting")
             except websockets.exceptions.ConnectionClosedError as error:
-                print(f"Connection dropped ({error}), reconnecting")
+                self.set_connection("dropped", "warning", f"Connection dropped ({error}), reconnecting")
             except websockets.exceptions.InvalidHandshake as error:
-                print(f"Binance refused the connection ({error})")
+                self.set_connection("refused", "warning", f"Binance refused the connection ({error})")
             except OSError as error:
-                print(f"Can't reach Binance, check the internet connection ({error})")
+                self.set_connection("unreachable", "warning",
+                                    f"Can't reach Binance, check the internet connection ({error})")
 
             if wait_s > 0:
-                print(f"Retrying in {wait_s} s")
+                self.connection["retry_at_ms"] = now_ms() + wait_s * 1000
+                self.log("info", f"Retrying in {wait_s} s")
             await self.sleep(wait_s)
             wait_s = next_retry_wait(wait_s)
 
 
+def run_in_terminal():
+    """Show the engine in the terminal: one line per event and one per new trade."""
+    live = LiveVwap()
+
+    def print_event(event):
+        print(("Warning: " if event["level"] == "warning" else "") + event["message"])
+
+    def print_trade():
+        trade = live.last_trade
+        vwap_text = format_vwap(live.tracker.vwap)
+        if not live.is_complete():  # yellow: VWAP doesn't include every trade yet
+            vwap_text = f"{YELLOW}{vwap_text}{RESET_COLOR}"
+        print(f"{format_time(trade['time_ms'])} UTC  "
+              f"price {trade['price']:.2f}  qty {trade['quantity']:g}  VWAP {vwap_text}")
+
+    live.on_event = print_event
+    live.on_trade = print_trade
+    asyncio.run(live.run())
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(LiveVwap().run())
+        run_in_terminal()
     except KeyboardInterrupt:
         print("Stopped.")
