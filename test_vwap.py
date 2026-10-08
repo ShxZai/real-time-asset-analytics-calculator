@@ -62,11 +62,14 @@ class FakeBinance:
     (for malformed messages). Every connection but the
     last closes normally after sending its trades, like Binance's 24 hour close.
     refuse_first: how many connection attempts get their handshake refused (HTTP 403).
+    deaf_first: how many accepted connections go silent after their trades: no close
+    and no pong, like a cut network.
     """
 
-    def __init__(self, connections, refuse_first=0):
+    def __init__(self, connections, refuse_first=0, deaf_first=0):
         self.connections = connections
         self.refuse_first = refuse_first
+        self.deaf_first = deaf_first
         self.attempts = 0
         self.accepted = 0
 
@@ -81,6 +84,12 @@ class FakeBinance:
         self.accepted += 1
         for trade in trades:
             await ws.send(trade if isinstance(trade, str) else json.dumps(trade))
+        if self.accepted <= self.deaf_first:
+            ws.transport.pause_reading()  # pings aren't read, so aren't answered
+            await asyncio.sleep(1)  # longer than the test's ping settings take to give up
+            ws.transport.resume_reading()  # now notice the engine has gone, so shutdown is quick
+            await ws.wait_closed()
+            return
         if self.accepted < len(self.connections):
             return  # returning closes the connection normally
         await ws.wait_closed()  # keep the last connection open until the server shuts down
@@ -93,14 +102,14 @@ async def wait_until(condition, timeout_s=5):
     await asyncio.wait_for(poll(), timeout_s)
 
 
-async def play(fake, done):
+async def play(fake, done, **live_settings):
     """Run LiveVwap against the fake server until done(live) is true, then stop it.
 
     Returns the LiveVwap and the list of reconnect waits it asked for.
     """
     async with websockets.serve(fake.handler, "127.0.0.1", 0, process_request=fake.process_request) as server:
         port = server.sockets[0].getsockname()[1]
-        live = vwap.LiveVwap(stream_url=f"ws://127.0.0.1:{port}")
+        live = vwap.LiveVwap(stream_url=f"ws://127.0.0.1:{port}", **live_settings)
         waits = []
 
         async def record_wait(seconds):
@@ -175,6 +184,24 @@ def test_refused_handshake_backs_off_then_connects(monkeypatch):
     assert waits == [0, 5, 10]
     assert live.tracker.cumulative_volume == 3
     assert sum("refused" in e["message"] for e in live.events) == 3
+    assert live.connection["state"] == "connected"
+
+
+def test_connection_that_stops_answering_pings_is_dropped_and_reconnected(monkeypatch):
+    t = MIDNIGHT_MS + 60_000
+    trades = [make_trade(i, 100, t + i) for i in range(3)]
+    monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
+    fake = FakeBinance([trades[:2], trades[2:]], deaf_first=1)  # first connection goes silent
+
+    live, waits = asyncio.run(play(fake, lambda live: live.checker.highest_id == 2,
+                                   ping_interval_s=0.2, ping_timeout_s=0.2, close_timeout_s=0.2))
+
+    assert fake.accepted == 2
+    assert any("ping timeout" in e["message"] for e in live.events)
+    states = [e["message"] for e in live.events if e["message"].startswith("Connection dropped")]
+    assert len(states) == 1
+    assert waits == [0]
+    assert live.tracker.cumulative_volume == 3
     assert live.connection["state"] == "connected"
 
 

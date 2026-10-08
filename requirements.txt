@@ -1,2 +1,4 @@
 websockets>=16
 pytest>=9
+fastapi>=0.143
+uvicorn>=0.52

@@ -36,6 +36,14 @@ MAX_RETRY_WAIT_S = 60
 # Trade times past this are treated as corrupt (datetime can't handle times that far off).
 MAX_TRADE_TIME_MS = int(datetime(3000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 MAX_EVENTS = 500  # the debug console keeps this many of the latest events
+# Ping Binance this often; no pong within PING_TIMEOUT_S means the connection is dead.
+# A pong proves the connection works even when the market is quiet.
+PING_INTERVAL_S = 5
+PING_TIMEOUT_S = 5
+# When closing (e.g. after a missed pong) the library says goodbye and waits this long
+# for Binance to answer. A dead network never answers, so this adds to detection time;
+# a live one answers well within it. Worst case to notice a cut: 5 + 5 + 1 = 11 s.
+CLOSE_TIMEOUT_S = 1
 
 YELLOW = "\033[33m"
 RESET_COLOR = "\033[0m"
@@ -391,8 +399,12 @@ class LiveVwap:
     reset time, highest ID and missing IDs all survive a reconnect.
     """
 
-    def __init__(self, stream_url=STREAM_URL, on_event=None, on_trade=None):
+    def __init__(self, stream_url=STREAM_URL, on_event=None, on_trade=None,
+                 ping_interval_s=PING_INTERVAL_S, ping_timeout_s=PING_TIMEOUT_S, close_timeout_s=CLOSE_TIMEOUT_S):
         self.stream_url = stream_url  # tests point this at a fake server
+        self.ping_interval_s = ping_interval_s  # tests shorten these
+        self.ping_timeout_s = ping_timeout_s
+        self.close_timeout_s = close_timeout_s
         self.sleep = asyncio.sleep  # tests swap this to record reconnect waits
         self.on_event = on_event  # called with each new event
         self.on_trade = on_trade  # called after each new live trade is counted
@@ -449,6 +461,7 @@ class LiveVwap:
             "symbol": SYMBOL,
             "connection": dict(self.connection),
             "history": self.history_state(),
+            "complete": self.is_complete(),
             "missing_count": len(self.checker.missing_ids),
             "session_start_ms": session_start_ms,
             "last_trade": dict(self.last_trade) if self.last_trade else None,
@@ -498,6 +511,9 @@ class LiveVwap:
     async def run(self):
         """Connect and receive trades forever, reconnecting with backoff when the connection ends.
 
+        A connection that stops answering pings (e.g. Wi-Fi cut) is closed by the
+        websockets library and counts as dropped.
+
         Retries straight away, then waits 5 s, 10 s, 20 s, ... up to MAX_RETRY_WAIT_S.
         The wait goes back to zero once a connection delivers a trade.
         """
@@ -505,7 +521,9 @@ class LiveVwap:
         while True:
             self.set_connection("connecting", "info", f"Connecting to {self.stream_url}")
             try:
-                async with websockets.connect(self.stream_url) as ws:
+                async with websockets.connect(self.stream_url, ping_interval=self.ping_interval_s,
+                                              ping_timeout=self.ping_timeout_s,
+                                              close_timeout=self.close_timeout_s) as ws:
                     self.set_connection("connected", "info", "Connected")
                     async for message in ws:
                         wait_s = 0
