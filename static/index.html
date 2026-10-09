@@ -60,6 +60,7 @@
     #console { max-height: 320px; overflow-y: auto; margin: 0; padding: 0 12px 8px; list-style: none; }
     #console li { padding: 2px 0; white-space: pre-wrap; word-break: break-word; }
     #console .time { color: var(--muted); }
+    #console .source { color: var(--blue); }
     #console .warning { color: var(--yellow); }
   </style>
 </head>
@@ -68,23 +69,14 @@
     <h1>ASSET ANALYTICS</h1>
     <span id="app-status" class="status">App: connecting</span>
     <span id="binance-status" class="status">Binance: -</span>
-    <span id="last-trade" class="status">Last trade: -</span>
   </header>
 
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Symbol</th><th>Price</th><th>VWAP</th><th>Volume</th><th>Buy/sell pressure</th></tr>
+        <tr><th>Symbol</th><th>Price</th><th>VWAP</th><th>Last trade</th><th>Volume</th><th>Buy/sell pressure</th></tr>
       </thead>
-      <tbody>
-        <tr id="row">
-          <td id="symbol">-</td>
-          <td id="price">-</td>
-          <td id="vwap">-</td>
-          <td>-</td>
-          <td>-</td>
-        </tr>
-      </tbody>
+      <tbody id="assets"></tbody> <!-- one row per asset, added by app.js -->
     </table>
   </div>
   <p class="legend">

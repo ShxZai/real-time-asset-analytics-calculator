@@ -22,20 +22,24 @@ import vwap
 MIDNIGHT_MS = vwap.next_midnight_ms(1_791_000_000_000)  # 00:00 UTC on 2026-10-04
 
 
-def make_trade(trade_id, price, trade_time_ms, quantity=1):
-    """A message shaped like Binance's aggTrade (numbers sent as text, like the real one)."""
-    return {"e": "aggTrade", "a": trade_id, "p": str(price), "q": str(quantity), "T": trade_time_ms}
+def make_trade(trade_id, price, trade_time_ms, quantity=1, symbol="XAUUSDT"):
+    """A trade shaped like Binance's aggTrade (numbers sent as text, like the real one)."""
+    return {"e": "aggTrade", "s": symbol, "a": trade_id, "p": str(price), "q": str(quantity), "T": trade_time_ms}
 
 
 def fake_rest(trades):
-    """A stand-in for vwap.get_json that serves these trades as if they were Binance's history."""
+    """A stand-in for vwap.get_json that serves trades as if they were Binance's history.
+
+    trades: a list (all one symbol), or {symbol: list} when several assets are tested.
+    """
     async def get_json(path, params, log):
         if path == "/fapi/v1/klines":
             return []  # no earlier candles: every test session starts in its first minute
+        rows = trades[params["symbol"]] if isinstance(trades, dict) else trades
         if "fromId" in params:
-            rows = [t for t in trades if t["a"] >= params["fromId"]]
+            rows = [t for t in rows if t["a"] >= params["fromId"]]
         else:
-            rows = [t for t in trades if t["T"] >= params["startTime"]]
+            rows = [t for t in rows if t["T"] >= params["startTime"]]
         return rows[: params["limit"]]
     return get_json
 
@@ -58,8 +62,9 @@ def fail_first(get_json, request_kind, bad_response):
 class FakeBinance:
     """A local WebSocket server that plays out a script of connections.
 
-    connections: one list of trades per accepted connection; a string is sent as-is
-    (for malformed messages). Every connection but the
+    connections: one list of trades per accepted connection. Each trade (dict) is
+    wrapped like Binance's combined stream ({"stream": ..., "data": trade}); a string
+    is sent as-is and anything else as plain JSON (for malformed messages). Every connection but the
     last closes normally after sending its trades, like Binance's 24 hour close.
     refuse_first: how many connection attempts get their handshake refused (HTTP 403).
     deaf_first: how many accepted connections go silent after their trades: no close
@@ -83,6 +88,8 @@ class FakeBinance:
         trades = self.connections[self.accepted]
         self.accepted += 1
         for trade in trades:
+            if isinstance(trade, dict):
+                trade = combined(trade)
             await ws.send(trade if isinstance(trade, str) else json.dumps(trade))
         if self.accepted <= self.deaf_first:
             ws.transport.pause_reading()  # pings aren't read, so aren't answered
@@ -95,6 +102,16 @@ class FakeBinance:
         await ws.wait_closed()  # keep the last connection open until the server shuts down
 
 
+def combined(trade):
+    """Wrap a trade the way Binance's combined stream does."""
+    return {"stream": f"{trade['s'].lower()}@aggTrade", "data": trade}
+
+
+def xau(live):
+    """The XAUUSDT asset: the single-asset tests run a feed with only this symbol."""
+    return live.assets["XAUUSDT"]
+
+
 async def wait_until(condition, timeout_s=5):
     async def poll():
         while not condition():
@@ -102,14 +119,14 @@ async def wait_until(condition, timeout_s=5):
     await asyncio.wait_for(poll(), timeout_s)
 
 
-async def play(fake, done, **live_settings):
-    """Run LiveVwap against the fake server until done(live) is true, then stop it.
+async def play(fake, done, symbols=("XAUUSDT",), **live_settings):
+    """Run a LiveFeed against the fake server until done(live) is true, then stop it.
 
-    Returns the LiveVwap and the list of reconnect waits it asked for.
+    Returns the LiveFeed and the list of reconnect waits it asked for.
     """
     async with websockets.serve(fake.handler, "127.0.0.1", 0, process_request=fake.process_request) as server:
         port = server.sockets[0].getsockname()[1]
-        live = vwap.LiveVwap(stream_url=f"ws://127.0.0.1:{port}", **live_settings)
+        live = vwap.LiveFeed(symbols, stream_url=f"ws://127.0.0.1:{port}", **live_settings)
         waits = []
 
         async def record_wait(seconds):
@@ -163,13 +180,13 @@ def test_normal_close_reconnects_straight_away_and_keeps_state(monkeypatch):
     monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
     fake = FakeBinance([trades[:3], trades[3:]])  # closes normally after trade 2
 
-    live, waits = asyncio.run(play(fake, lambda live: live.checker.highest_id == 4))
+    live, waits = asyncio.run(play(fake, lambda live: xau(live).checker.highest_id == 4))
 
     assert fake.accepted == 2
     assert waits == [0]  # reconnected with no wait
-    assert live.checker.missing_ids == set()
-    assert live.tracker.cumulative_volume == 5  # trades from both connections kept
-    assert math.isclose(live.tracker.vwap, 102)  # (100 + 101 + 102 + 103 + 104) / 5
+    assert xau(live).checker.missing_ids == set()
+    assert xau(live).tracker.cumulative_volume == 5  # trades from both connections kept
+    assert math.isclose(xau(live).tracker.vwap, 102)  # (100 + 101 + 102 + 103 + 104) / 5
 
 
 def test_refused_handshake_backs_off_then_connects(monkeypatch):
@@ -178,12 +195,12 @@ def test_refused_handshake_backs_off_then_connects(monkeypatch):
     monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
     fake = FakeBinance([trades], refuse_first=3)
 
-    live, waits = asyncio.run(play(fake, lambda live: live.checker.highest_id == 2))
+    live, waits = asyncio.run(play(fake, lambda live: xau(live).checker.highest_id == 2))
 
     assert fake.attempts == 4
     assert waits == [0, 5, 10]
-    assert live.tracker.cumulative_volume == 3
-    assert sum("refused" in e["message"] for e in live.events) == 3
+    assert xau(live).tracker.cumulative_volume == 3
+    assert sum("refused" in e["message"] for e in live.events()) == 3
     assert live.connection["state"] == "connected"
 
 
@@ -193,15 +210,15 @@ def test_connection_that_stops_answering_pings_is_dropped_and_reconnected(monkey
     monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
     fake = FakeBinance([trades[:2], trades[2:]], deaf_first=1)  # first connection goes silent
 
-    live, waits = asyncio.run(play(fake, lambda live: live.checker.highest_id == 2,
+    live, waits = asyncio.run(play(fake, lambda live: xau(live).checker.highest_id == 2,
                                    ping_interval_s=0.2, ping_timeout_s=0.2, close_timeout_s=0.2))
 
     assert fake.accepted == 2
-    assert any("ping timeout" in e["message"] for e in live.events)
-    states = [e["message"] for e in live.events if e["message"].startswith("Connection dropped")]
+    assert any("ping timeout" in e["message"] for e in live.events())
+    states = [e["message"] for e in live.events() if e["message"].startswith("Connection dropped")]
     assert len(states) == 1
     assert waits == [0]
-    assert live.tracker.cumulative_volume == 3
+    assert xau(live).tracker.cumulative_volume == 3
     assert live.connection["state"] == "connected"
 
 
@@ -217,19 +234,19 @@ def test_gap_across_midnight_drops_old_day_and_keeps_new_day(monkeypatch):
     fake = FakeBinance([[trades[0]], [trades[5]]])
 
     def gap_filled(live):
-        return live.checker.highest_id == 5 and not live.checker.missing_ids and not live.fetch_tasks
+        return xau(live).checker.highest_id == 5 and not xau(live).checker.missing_ids and not live.fetch_tasks
 
     live, _ = asyncio.run(play(fake, gap_filled))
 
-    assert live.tracker.next_reset_ms == MIDNIGHT_MS + vwap.DAY_MS  # in the new session
-    assert live.tracker.cumulative_volume == 3  # trades 3, 4, 5 only
-    assert math.isclose(live.tracker.vwap, 5)  # (4 + 5 + 6) / 3; 4 would mean 1 and 2 leaked in
+    assert xau(live).tracker.next_reset_ms == MIDNIGHT_MS + vwap.DAY_MS  # in the new session
+    assert xau(live).tracker.cumulative_volume == 3  # trades 3, 4, 5 only
+    assert math.isclose(xau(live).tracker.vwap, 5)  # (4 + 5 + 6) / 3; 4 would mean 1 and 2 leaked in
 
 
 # ---------- bad messages and failed fetches (offline, fake server + fake REST) ----------
 
 def all_counted(live):
-    return not live.checker.missing_ids and not live.fetch_tasks
+    return not xau(live).checker.missing_ids and not live.fetch_tasks
 
 
 def test_bad_stream_messages_are_skipped_without_reconnecting(monkeypatch):
@@ -237,13 +254,19 @@ def test_bad_stream_messages_are_skipped_without_reconnecting(monkeypatch):
     trades = [make_trade(i, 100 + i, t + i) for i in range(3)]
     monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
     # Trade 1 arrives broken (price "nan"), so it's skipped and then fetched as a gap.
-    fake = FakeBinance([[trades[0], "not json", ["a", "list"], {**trades[1], "p": "nan"}, trades[2]]])
+    # A trade for a symbol this feed doesn't track is skipped too.
+    other = make_trade(50, 999, t, symbol="DOGEUSDT")
+    fake = FakeBinance([[trades[0], "not json", ["a", "list"], other, {**trades[1], "p": "nan"}, trades[2]]])
 
-    live, waits = asyncio.run(play(fake, lambda live: live.checker.highest_id == 2 and all_counted(live)))
+    live, waits = asyncio.run(play(fake, lambda live: xau(live).checker.highest_id == 2 and all_counted(live)))
 
     assert fake.accepted == 1 and waits == []  # the connection was never dropped
-    assert live.tracker.cumulative_volume == 3
-    assert math.isclose(live.tracker.vwap, 101)  # (100 + 101 + 102) / 3
+    assert xau(live).tracker.cumulative_volume == 3
+    assert math.isclose(xau(live).tracker.vwap, 101)  # (100 + 101 + 102) / 3
+    # Unreadable or untracked messages go to the system log; a bad XAUUSDT trade to XAUUSDT's.
+    system_skips = [e for e in live.system.events if e["message"].startswith("Skipped")]
+    asset_skips = [e for e in xau(live).event_log.events if e["message"].startswith("Skipped")]
+    assert len(system_skips) == 3 and len(asset_skips) == 1
 
 
 def test_failed_startup_fetch_is_started_again_not_dropped(monkeypatch):
@@ -254,11 +277,11 @@ def test_failed_startup_fetch_is_started_again_not_dropped(monkeypatch):
     monkeypatch.setattr(vwap, "get_json", fail_first(fake_rest(trades), "startTime", error))
     fake = FakeBinance([[trades[3]]])  # starts mid-session: trades 0-2 come from the fetch
 
-    live, _ = asyncio.run(play(fake, lambda live: live.backfill_task is not None and all_counted(live)))
+    live, _ = asyncio.run(play(fake, lambda live: xau(live).backfill_task is not None and all_counted(live)))
 
-    assert any("Fetching earlier trades failed" in e["message"] for e in live.events)
-    assert live.tracker.cumulative_volume == 4
-    assert math.isclose(live.tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
+    assert any("Fetching earlier trades failed" in e["message"] for e in live.events())
+    assert xau(live).tracker.cumulative_volume == 4
+    assert math.isclose(xau(live).tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
 
 
 def test_failed_gap_fetch_is_started_again_without_counting_twice(monkeypatch):
@@ -270,18 +293,20 @@ def test_failed_gap_fetch_is_started_again_without_counting_twice(monkeypatch):
     monkeypatch.setattr(vwap, "get_json", fail_first(fake_rest(trades), "fromId", bad_page))
     fake = FakeBinance([[trades[0], trades[3]]])  # gap 1-2
 
-    live, _ = asyncio.run(play(fake, lambda live: live.checker.highest_id == 3 and all_counted(live)))
+    live, _ = asyncio.run(play(fake, lambda live: xau(live).checker.highest_id == 3 and all_counted(live)))
 
-    assert live.tracker.cumulative_volume == 4
-    assert math.isclose(live.tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
+    assert xau(live).tracker.cumulative_volume == 4
+    assert math.isclose(xau(live).tracker.vwap, 101.5)  # (100 + 101 + 102 + 103) / 4
 
 
 # ---------- state and events for a display (offline) ----------
 
 def test_snapshot_before_the_first_trade_is_empty_and_waiting():
-    snapshot = vwap.LiveVwap().snapshot()
-    assert snapshot["history"] == "waiting"
-    assert snapshot["vwap"] is None and snapshot["last_trade"] is None and snapshot["session_start_ms"] is None
+    snapshot = vwap.LiveFeed().snapshot()
+    assert [asset["symbol"] for asset in snapshot["assets"]] == vwap.SYMBOLS
+    for asset in snapshot["assets"]:
+        assert asset["history"] == "waiting"
+        assert asset["vwap"] is None and asset["last_trade"] is None and asset["session_start_ms"] is None
 
 
 def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
@@ -290,34 +315,77 @@ def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
     monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
     fake = FakeBinance([[trades[0]], [trades[3]]])  # gap 1-2 across a reconnect
 
-    live, _ = asyncio.run(play(fake, lambda live: live.checker.highest_id == 3 and all_counted(live)))
+    live, _ = asyncio.run(play(fake, lambda live: xau(live).checker.highest_id == 3 and all_counted(live)))
     snapshot = live.snapshot()
+    asset = snapshot["assets"][0]
 
     assert snapshot["connection"]["state"] == "connected"
-    assert snapshot["history"] == "done" and snapshot["missing_count"] == 0
-    assert snapshot["session_start_ms"] == MIDNIGHT_MS
-    assert snapshot["last_trade"]["price"] == 103 and snapshot["last_trade"]["time_ms"] == t + 3
-    assert math.isclose(snapshot["vwap"], 101.5)  # (100 + 101 + 102 + 103) / 4
-    messages = [e["message"] for e in snapshot["events"]]
+    assert asset["symbol"] == "XAUUSDT"
+    assert asset["history"] == "done" and asset["missing_count"] == 0
+    assert asset["session_start_ms"] == MIDNIGHT_MS
+    assert asset["last_trade"]["price"] == 103 and asset["last_trade"]["time_ms"] == t + 3
+    assert math.isclose(asset["vwap"], 101.5)  # (100 + 101 + 102 + 103) / 4
+
+    # The gap is in the XAUUSDT log; connection events are in the system log.
+    messages = [e["message"] for e in xau(live).event_log.events]
     assert any(m.startswith("Gap: 2 trades missing") for m in messages)
     assert any(m.startswith("Gap 1-2 filled") for m in messages)
-    ids = [e["id"] for e in snapshot["events"]]
-    assert ids == sorted(ids) and len(set(ids)) == len(ids)
+    assert all(e["symbol"] is None for e in live.system.events)
+    assert any(e["message"] == "Connected" for e in live.system.events)
+    for log in (live.system, xau(live).event_log):
+        ids = [e["id"] for e in log.events]
+        assert ids == list(range(len(ids)))  # each log counts its own IDs from 0
+    merged = live.events()
+    assert [e["time_ms"] for e in merged] == sorted(e["time_ms"] for e in merged)
 
     snapshot["connection"]["state"] = "changed"
-    snapshot["events"].clear()
-    assert live.connection["state"] == "connected" and live.events  # the engine wasn't touched
+    asset["last_trade"]["price"] = 0
+    assert live.connection["state"] == "connected"  # the engine wasn't touched
+    assert xau(live).last_trade["price"] == 103
 
 
-def test_event_list_keeps_only_the_latest_events():
-    live = vwap.LiveVwap()
+def test_each_log_keeps_only_its_own_latest_events():
+    live = vwap.LiveFeed(["BTCUSDT", "XAUUSDT"])
     seen = []
-    live.on_event = seen.append
+    live.on_event = seen.append  # set after the feed is made, like the server does
     for i in range(vwap.MAX_EVENTS + 100):
-        live.log("info", f"event {i}")
-    assert len(seen) == vwap.MAX_EVENTS + 100  # the callback sees every event
-    assert len(live.events) == vwap.MAX_EVENTS
-    assert live.events[0]["id"] == 100  # the oldest 100 were dropped
+        live.assets["BTCUSDT"].log("info", f"event {i}")
+    live.assets["XAUUSDT"].log("info", "quiet asset")
+    live.log("info", "system event")
+    assert len(seen) == vwap.MAX_EVENTS + 102  # the callback sees every event, from every log
+    btc = live.assets["BTCUSDT"].event_log.events
+    assert len(btc) == vwap.MAX_EVENTS
+    assert btc[0]["id"] == 100  # the oldest 100 were dropped
+    # A busy asset can't push another log's events out, and each log numbers from 0.
+    assert [(e["symbol"], e["id"]) for e in live.assets["XAUUSDT"].event_log.events] == [("XAUUSDT", 0)]
+    assert [(e["symbol"], e["id"]) for e in live.system.events] == [(None, 0)]
+
+
+# ---------- several assets on one connection (offline) ----------
+
+def test_two_assets_on_one_connection_keep_separate_totals_ids_and_gaps(monkeypatch):
+    t = MIDNIGHT_MS + 60_000
+    btc = [make_trade(i, 1000 + i, t + i, symbol="BTCUSDT") for i in range(4)]
+    eth = [make_trade(i, 10 + i, t + i, symbol="ETHUSDT") for i in range(3)]  # same IDs as BTC
+    monkeypatch.setattr(vwap, "get_json", fake_rest({"BTCUSDT": btc, "ETHUSDT": eth}))
+    # Interleaved on one connection; BTC skips IDs 1-2, ETH has no gap.
+    fake = FakeBinance([[btc[0], eth[0], eth[1], btc[3], eth[2]]])
+
+    def done(live):
+        return (live.assets["BTCUSDT"].checker.highest_id == 3 and live.assets["ETHUSDT"].checker.highest_id == 2
+                and not live.assets["BTCUSDT"].checker.missing_ids and not live.fetch_tasks)
+
+    live, _ = asyncio.run(play(fake, done, symbols=("BTCUSDT", "ETHUSDT")))
+    btc_asset, eth_asset = live.assets["BTCUSDT"], live.assets["ETHUSDT"]
+
+    assert btc_asset.tracker.cumulative_volume == 4
+    assert math.isclose(btc_asset.tracker.vwap, 1001.5)  # (1000 + 1001 + 1002 + 1003) / 4
+    assert eth_asset.tracker.cumulative_volume == 3
+    assert math.isclose(eth_asset.tracker.vwap, 11)  # (10 + 11 + 12) / 3; any BTC mixed in would be far off
+    # ETH IDs that match BTC IDs weren't taken as duplicates, and the BTC gap stayed in BTC.
+    assert not any("Duplicate" in e["message"] for e in live.events())
+    assert any(e["message"].startswith("Gap: 2 trades missing") for e in btc_asset.event_log.events)
+    assert not any(e["message"].startswith("Gap") for e in eth_asset.event_log.events)
 
 
 # ---------- checking data and REST retries (offline) ----------
@@ -373,10 +441,14 @@ def test_get_json_waits_as_long_as_binance_asks_when_rate_limited(monkeypatch):
 
 # ---------- live tests (real Binance) ----------
 
+LIVE_SYMBOL = "XAUUSDT"
+LIVE_URL = vwap.combined_stream_url([LIVE_SYMBOL])
+
+
 def official_totals(session_start_ms, boundary_ms):
     """Sum Binance's closed 1m candles from session start up to (not including) boundary."""
     candles = vwap.fetch_json("/fapi/v1/klines", {
-        "symbol": vwap.SYMBOL, "interval": "1m", "limit": 1500,
+        "symbol": LIVE_SYMBOL, "interval": "1m", "limit": 1500,
         "startTime": session_start_ms, "endTime": boundary_ms - 1})
     candles = [c for c in candles if c[6] < boundary_ms]
     return sum(float(c[7]) for c in candles), sum(float(c[5]) for c in candles)
@@ -389,7 +461,7 @@ def assert_matches_official(tracker, boundary_ms):
     assert math.isclose(tracker.vwap, pv / volume, rel_tol=1e-9)
 
 
-async def receive_until_boundary(live, ws, ready):
+async def receive_until_boundary(asset, ws, ready):
     """Feed live trades in until ready() is true, then stop at the next minute boundary.
 
     The trade that crosses the boundary is not added, so our totals cover exactly
@@ -397,18 +469,18 @@ async def receive_until_boundary(live, ws, ready):
     """
     boundary_ms = None
     async for message in ws:
-        trade = json.loads(message)
+        trade = json.loads(message)["data"]
         if boundary_ms is None and ready():
             boundary_ms = trade["T"] - trade["T"] % vwap.MINUTE_MS + vwap.MINUTE_MS
         if boundary_ms is not None and trade["T"] >= boundary_ms:
             return boundary_ms
-        live.handle_trade(trade)
+        asset.handle_trade(trade)
 
 
 def test_live_startup_fetch_matches_official_candles():
     async def scenario():
-        live = vwap.LiveVwap()
-        async with websockets.connect(vwap.STREAM_URL) as ws:
+        live = vwap.AssetTracker(LIVE_SYMBOL)
+        async with websockets.connect(LIVE_URL) as ws:
             boundary_ms = await receive_until_boundary(
                 live, ws, lambda: live.backfill_task is not None and live.backfill_task.done())
         await asyncio.sleep(3)  # let the last candle close on Binance's side
@@ -420,17 +492,17 @@ def test_live_startup_fetch_matches_official_candles():
 
 def test_live_forced_reconnect_fills_gap_and_matches_official_candles():
     async def scenario():
-        live = vwap.LiveVwap()
-        async with websockets.connect(vwap.STREAM_URL) as ws:
+        live = vwap.AssetTracker(LIVE_SYMBOL)
+        async with websockets.connect(LIVE_URL) as ws:
             async for message in ws:
-                live.handle_trade(json.loads(message))
+                live.handle_trade(json.loads(message)["data"])
                 if live.backfill_task.done():
                     break
         highest_before = live.checker.highest_id
         await asyncio.sleep(10)  # offline on purpose; Binance keeps trading
 
         handled_after = []
-        async with websockets.connect(vwap.STREAM_URL) as ws:
+        async with websockets.connect(LIVE_URL) as ws:
             def gap_filled():
                 handled_after.append(True)
                 return len(handled_after) > 1 and not live.checker.missing_ids and not live.fetch_tasks

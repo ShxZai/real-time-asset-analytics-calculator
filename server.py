@@ -1,17 +1,18 @@
-"""Web page for the live VWAP engine.
+"""Web page for the live VWAP engine (several assets on one Binance connection).
 
 Run `python server.py`, then open http://127.0.0.1:8000 in a browser.
 
 One engine runs for the whole program, in the same asyncio loop as the server, so
 every open page shares one Binance connection. A page opens two WebSockets:
 
-- /ws/state: the full state every STATE_INTERVAL_S. The page compares it with what
-  it shows and changes only what differs.
-- /ws/events: the latest events first (history), then each new event as it happens.
-  The page rebuilds its console from the history on every connect.
+- /ws/state: the full state of every asset every STATE_INTERVAL_S, in one message.
+  The page compares it with what it shows and changes only what differs.
+- /ws/events: the latest events of every log first (history), then each new event
+  as it happens. The page rebuilds its console from the history on every connect.
 
-GET /events/{id} returns one event that's still kept, so a page can fetch an ID it
-didn't receive.
+Each asset and the system have their own event log with their own IDs, so an event
+is named by (symbol, id). GET /events/{symbol}/{id} returns one event that's still
+kept ("system" for the system log), so a page can fetch an ID it didn't receive.
 """
 
 import asyncio
@@ -23,7 +24,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from vwap import LiveVwap
+from vwap import LiveFeed
 
 HOST = "127.0.0.1"  # only this machine can open the page
 PORT = 8000
@@ -33,14 +34,12 @@ PAGE_QUEUE_SIZE = 1000
 STATIC_DIR = Path(__file__).parent / "static"
 
 TRY_AGAIN_LATER = 1013  # WebSocket close code
+SYSTEM_LOG = "system"  # the system log's name in URLs (its events have symbol None)
 
 
 def state_message(live):
-    """The engine's snapshot without the events (those go over /ws/events)."""
-    state = live.snapshot()
-    del state["events"]
-    state["type"] = "state"
-    return state
+    """The engine's snapshot: the connection and every asset (events go over /ws/events)."""
+    return {"type": "state", **live.snapshot()}
 
 
 class EventFanOut:
@@ -62,7 +61,7 @@ class EventFanOut:
         """
         queue = asyncio.Queue(maxsize=PAGE_QUEUE_SIZE)
         self.queues.add(queue)
-        return list(self.live.events), queue
+        return self.live.events(), queue
 
     def unsubscribe(self, queue):
         self.queues.discard(queue)
@@ -99,12 +98,15 @@ def create_app(live, run_engine=True):
     async def page():
         return FileResponse(STATIC_DIR / "index.html")
 
-    @app.get("/events/{event_id}")
-    async def get_event(event_id: int):
-        for event in live.events:
-            if event["id"] == event_id:
-                return event
-        raise HTTPException(404, f"Event {event_id} isn't kept (only the latest {live.events.maxlen} are)")
+    @app.get("/events/{symbol}/{event_id}")
+    async def get_event(symbol: str, event_id: int):
+        log = live.event_log(None if symbol == SYSTEM_LOG else symbol)
+        if log is None:
+            raise HTTPException(404, f"No event log for {symbol}")
+        event = log.find(event_id)
+        if event is None:
+            raise HTTPException(404, f"Event {symbol}/{event_id} isn't kept (only the latest {log.events.maxlen} are)")
+        return event
 
     @app.websocket("/ws/state")
     async def state_feed(ws: WebSocket):
@@ -157,7 +159,7 @@ async def send_until_closed(ws, send):
 
 
 def main():
-    app = create_app(LiveVwap())
+    app = create_app(LiveFeed())
     print(f"Open http://{HOST}:{PORT} in a browser. Press Ctrl+C to stop.")
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
 

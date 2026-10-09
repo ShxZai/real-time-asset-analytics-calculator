@@ -2,11 +2,13 @@
 
 Turns a live market data feed into metrics as trades happen.
 
-Right now it tracks one asset and one metric: the **VWAP** (volume-weighted average
-price) of **XAUUSDT**, gold priced in USDT on Binance USDⓈ-M futures. You run it in
-the terminal, and it recalculates VWAP on every aggregated trade from Binance's
-live stream. Each session resets at 00:00 UTC. You can watch it in the terminal or
-on a live web page.
+Right now it tracks three assets on Binance USDⓈ-M futures, **BTCUSDT**, **ETHUSDT**
+and **XAUUSDT** (gold), and one metric: the **VWAP** (volume-weighted average price).
+One combined stream connection carries every asset's trades, and VWAP is recalculated
+on every aggregated trade. Each asset keeps its own totals, trade ID checks and event
+log, so a gap in one never touches another. Each session resets at 00:00 UTC. You can
+watch it in the terminal or on a live web page. Adding an asset means adding its
+symbol to `SYMBOLS` in `vwap.py`.
 
 It currently also:
 
@@ -31,16 +33,17 @@ pip install -r requirements.txt
 python server.py
 ```
 
-Then open http://127.0.0.1:8000. The page receives the state every 300 ms and each
-event as it happens over WebSockets, shows when Binance or the app is disconnected
-or the feed has stalled, and has a debug console listing gaps, duplicates and
-reconnects. For terminal output instead, run `python vwap.py`.
+Then open http://127.0.0.1:8000. The page shows one row per asset. It receives the
+state of every asset every 300 ms and each event as it happens over WebSockets,
+shows when Binance or the app is disconnected and how long ago each asset last
+traded, and has a debug console listing gaps, duplicates and reconnects, each
+marked with its asset (or SYSTEM for the connection). For terminal output instead, run `python vwap.py`.
 
 Press Ctrl+C to stop.
 
 ## Backtest
 
-Recomputes a full day's VWAP from Binance's historical trade file and checks it
+Recomputes a full day's XAUUSDT VWAP from Binance's historical trade file and checks it
 against Binance's official daily figures (defaults to yesterday, UTC):
 
 ```
@@ -60,5 +63,5 @@ take about 2 minutes.
 ## Roadmap
 
 - More metrics
-- More assets, each shown with its metrics
+- An equal-weighted index across the assets
 - Comparing assets on the page
