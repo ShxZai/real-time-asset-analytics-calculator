@@ -337,19 +337,22 @@ def test_rolling_window_counts_the_last_60_seconds_by_trade_time():
     assert w.totals(200_000) == [0, 0, 0, 0, 0]  # quiet market: the window empties with time
 
 
-def test_rolling_metrics_warm_up_for_60_seconds_after_the_first_live_trade():
+def test_rolling_metrics_warm_up_from_the_first_live_trade_until_the_fetch_fills_them():
     asset = vwap.AssetTracker("XAUUSDT")
-    asset.first_live_ms = 1_000_500
+    asset.window.complete_from_ms = 1_000_500  # first live trade; the startup fetch hasn't finished
     asset.window.add(100, 1, 1_000_500, True)
     asset.last_trade = {"price": 100, "quantity": 1, "time_ms": 1_020_200, "received_ms": vwap.now_ms()}
     # Binance's time is about 1 020 200: second 1020, and the window is full from second 1060.
     assert asset.rolling_snapshot()["warmup_s"] == 40
+    asset.window.complete_from_ms = vwap.window_fetch_start_ms(1_000_500)  # the fetch has finished
+    assert asset.rolling_snapshot()["warmup_s"] == 0
 
 
 def test_startup_fetch_sums_buy_volume_from_candles_and_trades(monkeypatch):
     first_live = make_trade(12, 100, MIDNIGHT_MS + 2 * vwap.MINUTE_MS + 500)
     candles = [make_candle(MIDNIGHT_MS, 5, 500, 2, 200), make_candle(MIDNIGHT_MS + vwap.MINUTE_MS, 0, 0, 0, 0)]
-    trades = [make_trade(10, 100, first_live["T"] - 200, quantity=2, is_buy=False),
+    trades = [make_trade(9, 100, MIDNIGHT_MS + 90_000, quantity=5),  # in the second candle: window only
+              make_trade(10, 100, first_live["T"] - 200, quantity=2, is_buy=False),
               make_trade(11, 100, first_live["T"] - 100, quantity=3), first_live]
     rest = fake_rest(trades)
 
@@ -358,13 +361,18 @@ def test_startup_fetch_sums_buy_volume_from_candles_and_trades(monkeypatch):
 
     monkeypatch.setattr(vwap, "get_json", get_json)
     result = asyncio.run(vwap.fetch_earlier_trades("XAUUSDT", MIDNIGHT_MS, first_live, lambda *_: None))
-    # pv, volume, buy pv (200 + 300), buy volume (2 + 3), candles, trades
-    assert result == (1000, 10, 500, 5, 2, 2)
+    # pv, volume, buy pv (200 + 300), buy volume (2 + 3), candles, trades; trade 9 isn't counted twice
+    *totals, recent = result
+    assert tuple(totals) == (1000, 10, 500, 5, 2, 2)
+    # The window gets the trades of the last minute before the first live trade, from both sources.
+    assert recent == [(100, 5, MIDNIGHT_MS + 90_000, True), (100, 2, first_live["T"] - 200, False),
+                      (100, 3, first_live["T"] - 100, True)]
 
 
 def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
     t = MIDNIGHT_MS + 80_000
     # Quantities 1-4; trades 1 and 3 are sells. Trade 0 is 70 s older than the rest.
+    # The fake REST server has only these trades, so the startup fetch adds none to the window.
     trades = [make_trade(i, 100 + i, t + i - (70_000 if i == 0 else 0), quantity=i + 1, is_buy=i % 2 == 0)
               for i in range(4)]
     monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
@@ -387,7 +395,7 @@ def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
     assert asset["flow"]["base"] == {"buy": 4, "sell": 6, "delta": -2}
 
     # Trade 0 is outside the last 60 s, so the rolling window has only trades 1-3 (the gap fill
-    # included). The first live trade was 70 s before the last, so the window is already full.
+    # included). The startup fetch has finished, so the window is full.
     rolling = asset["rolling"]
     assert rolling["warmup_s"] == 0
     assert math.isclose(rolling["vwap"], (101 * 2 + 102 * 3 + 103 * 4) / 9)

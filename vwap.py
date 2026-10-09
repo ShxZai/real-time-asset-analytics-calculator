@@ -10,7 +10,8 @@ Each asset has two sets of metrics:
 - session (since 00:00 UTC): VWAP, distance of the price from it, and buy and sell
   volume with their difference (delta; over the session this is CVD).
 - rolling (the last ROLLING_WINDOW_S seconds): VWAP, buy and sell volume, delta,
-  trades per second and volume per minute.
+  trades per second and volume per minute. The startup fetch also brings the minute
+  before the first live trade, so the window is full within seconds of starting.
 A trade counts as a buy when the buyer was the taker (hit the ask), as a sell when
 the seller was (Binance's "m" flag: buyer is maker). Every volume is kept twice: in
 USDT (price x quantity, the quote asset) and in the coin itself (the base asset).
@@ -146,6 +147,9 @@ class RollingWindow:
 
     def __init__(self):
         self.buckets = {}  # trade time in whole seconds -> [pv, volume, buy_pv, buy_volume, trade_count]
+        # The window has every trade from this time on (None before the first live trade).
+        # It's the first live trade's time, then earlier once the startup fetch has added the minute before it.
+        self.complete_from_ms = None
         self.newest_s = None
 
     def add(self, price, quantity, trade_time_ms, is_buy):
@@ -366,16 +370,34 @@ async def retry_on_error(name, log, function, *args):
             wait_s = next_retry_wait(wait_s)
 
 
+def window_fetch_start_ms(first_trade_time_ms):
+    """Where the startup fetch starts its aggTrades, so the rolling window is full at once.
+
+    A whole second, ROLLING_WINDOW_S before the first live trade's second: the window
+    counts whole seconds, so this covers every second it can include.
+    """
+    return (first_trade_time_ms // 1000 - ROLLING_WINDOW_S) * 1000
+
+
 async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
     """Sum one asset's trades in the session from before its first live trade.
 
     1m candles cover the session start up to the start of the first live trade's
     minute (not including it). aggTrades cover that minute up to, but not including,
-    the first live trade. Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count).
+    the first live trade.
+
+    The aggTrades start earlier, ROLLING_WINDOW_S before the first live trade (see
+    window_fetch_start_ms), so the rolling window can be filled straight away. Trades
+    before the first live trade's minute are already in the candles, so they only go
+    to the window (and that includes trades from before the session start).
+
+    Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count, recent):
+    recent is a list of (price, quantity, time_ms, is_buy) for the window.
     """
     first_live_id = first_trade["a"]
     minute_start_ms = first_trade["T"] - first_trade["T"] % MINUTE_MS
     totals = [0.0, 0.0, 0.0, 0.0]  # pv, volume, buy_pv, buy_volume
+    recent = []
 
     candle_count = 0
     if minute_start_ms > session_start_ms:
@@ -395,7 +417,7 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
             candle_count += 1
 
     trade_count = 0
-    params = {"symbol": symbol, "startTime": minute_start_ms, "limit": 1000}
+    params = {"symbol": symbol, "startTime": window_fetch_start_ms(first_trade["T"]), "limit": 1000}
     while True:
         trades = await get_json("/fapi/v1/aggTrades", params, log)
         check_list(trades, "/fapi/v1/aggTrades")
@@ -406,19 +428,34 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
         for trade in trades:
             check_trade(trade)
             if trade["a"] >= first_live_id:
-                return *totals, candle_count, trade_count
-            for i, value in enumerate(trade_totals(float(trade["p"]), float(trade["q"]), is_buy(trade))):
+                return *totals, candle_count, trade_count, recent
+            price, quantity = float(trade["p"]), float(trade["q"])
+            recent.append((price, quantity, trade["T"], is_buy(trade)))
+            if trade["T"] < minute_start_ms:
+                continue  # already in the candles
+            for i, value in enumerate(trade_totals(price, quantity, is_buy(trade))):
                 totals[i] += value
             trade_count += 1
         params = {"symbol": symbol, "fromId": trades[-1]["a"] + 1, "limit": 1000}
 
 
-async def backfill(symbol, tracker, first_trade, log):
-    """Fetch the session's earlier trades and add them to the tracker's totals."""
+async def backfill(symbol, tracker, window, first_trade, log):
+    """Fetch the session's earlier trades and add them to the tracker's totals.
+
+    The last minute's trades also go into the rolling window, so it's full at once.
+    Nothing is added until the whole fetch has finished, so starting it again after
+    a failure can't add anything twice.
+    """
     session_reset_ms = tracker.next_reset_ms
     session_start_ms = session_reset_ms - DAY_MS
     log("info", f"Fetching earlier trades since {format_time(session_start_ms)} UTC")
-    *totals, candle_count, trade_count = await fetch_earlier_trades(symbol, session_start_ms, first_trade, log)
+    *totals, candle_count, trade_count, recent = await fetch_earlier_trades(
+        symbol, session_start_ms, first_trade, log)
+
+    # The window doesn't depend on the session, so this holds even if a new one started.
+    for trade in recent:
+        window.add(*trade)
+    window.complete_from_ms = window_fetch_start_ms(first_trade["T"])
 
     if tracker.next_reset_ms != session_reset_ms:
         log("info", "A new session started before the fetch finished; discarding the fetched trades")
@@ -521,7 +558,6 @@ class AssetTracker:
         self.tracker = VwapTracker()
         self.window = RollingWindow()
         self.checker = TradeIdChecker()
-        self.first_live_ms = None  # time of the first live trade; the window is full 60 s after it
         self.backfill_task = None
         self.fetch_tasks = set()  # keeps running fetch tasks referenced until they finish
         self.last_trade = None  # the latest new live trade: price, quantity, time_ms, received_ms
@@ -550,15 +586,16 @@ class AssetTracker:
     def rolling_snapshot(self):
         """The rolling window's metrics, or None before the first trade.
 
-        "warmup_s" is how many seconds are left until the window holds a full
-        ROLLING_WINDOW_S of trades seen live (0 once it does); until then the window
-        is missing the trades from before the app started, so its numbers are too low.
+        "warmup_s" is how many seconds are left until the window holds every trade of
+        the last ROLLING_WINDOW_S (0 once it does). The startup fetch usually fills it
+        within seconds; until then (or if that fetch keeps failing) it fills with live
+        trades, and its numbers would be too low.
         """
         if self.last_trade is None:
             return None
         binance_now_ms = self.binance_now_ms()
         pv, volume, buy_pv, buy_volume, trade_count = self.window.totals(binance_now_ms)
-        full_at_s = self.first_live_ms // 1000 + ROLLING_WINDOW_S
+        full_at_s = self.window.complete_from_ms // 1000 + ROLLING_WINDOW_S
         return {
             "warmup_s": max(0, full_at_s - binance_now_ms // 1000),
             "vwap": pv / volume if volume > 0 else None,
@@ -625,9 +662,9 @@ class AssetTracker:
 
         # The first live trade sets the session, so the startup fetch can start now.
         if self.backfill_task is None:
-            self.first_live_ms = trade_time_ms
+            self.window.complete_from_ms = trade_time_ms
             self.backfill_task = self.start_task("Fetching earlier trades", backfill,
-                                                 self.symbol, self.tracker, trade, self.log)
+                                                 self.symbol, self.tracker, self.window, trade, self.log)
         if gap is not None:
             first_id, last_id = gap
             self.log("info", f"Gap: {last_id - first_id + 1} trades missing (IDs {first_id}-{last_id}); fetching from REST")

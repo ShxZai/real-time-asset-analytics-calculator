@@ -23,8 +23,9 @@ Metrics, per asset:
 A trade is a buy when the buyer was the taker (bought at the ask) and a sell when the
 seller was, as given by Binance's `m` flag. Every volume is shown in USDT (price ×
 quantity) and in the coin itself (BTC, ETH, XAU = troy ounces); a switch on the page
-picks which one is shown large. The rolling window starts filling with the first live trade, so its metrics
-show "Warming up" for the first 60 seconds.
+picks which one is shown large. When the app starts, it also fetches the trades of the 60 seconds before it
+connected, so the rolling metrics are ready within seconds (they show "Warming up"
+until that fetch is in).
 
 It currently also:
 

@@ -6,6 +6,7 @@
   <title>Asset Analytics</title>
   <style>
     :root {
+      color-scheme: dark; /* dark scrollbars and form controls */
       --bg: #0b0d10;
       --panel: #14171c;
       --line: #262b33;
@@ -17,6 +18,8 @@
       --blue: #58a6ff;
     }
     * { box-sizing: border-box; }
+    /* Keep room for the scrollbar even when the page is short, so it appearing doesn't narrow the table. */
+    html { scrollbar-gutter: stable; }
     body {
       margin: 0;
       padding: 16px;
@@ -47,6 +50,17 @@
     th:first-child, td:first-child { text-align: left; }
     th { color: var(--muted); font-weight: normal; }
     .table-wrap { overflow-x: auto; }
+
+    /* Each width fits the longest value the column can show (cell padding is the 24px). The page font is
+       monospace, so every digit is the same width and a value's width depends only on its length. */
+    table { table-layout: fixed; }
+    col.w-symbol { width: calc(8ch + 24px); }   /* BTCUSDT */
+    col.w-price { width: calc(10ch + 24px); }   /* 123456.78 */
+    col.w-age { width: calc(10ch + 24px); }     /* 999 s ago */
+    col.w-pct { width: calc(8ch + 24px); }      /* +10.00% */
+    col.w-volume { width: calc(14ch + 24px); }  /* -308.84M USDT, +1,234,567 ETH */
+    col.w-rate { width: calc(9ch + 24px); }     /* Trades/s */
+    td.placeholder { white-space: normal; }     /* "Waiting for first trade" wraps instead of widening the column */
 
     th.group { text-align: center; color: var(--text); }
     .start { border-left: 1px solid var(--line); } /* first column of a group */
@@ -97,6 +111,13 @@
 
   <div class="table-wrap">
     <table>
+      <!-- Fixed widths, so a number getting longer never moves the columns. -->
+      <colgroup>
+        <col class="w-symbol"><col class="w-price"><col class="w-age">
+        <col class="w-price"><col class="w-pct"><col class="w-volume"><col class="w-volume"><col class="w-volume">
+        <col class="w-price"><col class="w-volume"><col class="w-volume"><col class="w-volume">
+        <col class="w-rate"><col class="w-volume">
+      </colgroup>
       <thead>
         <tr>
           <th rowspan="2">Symbol</th><th rowspan="2">Price</th><th rowspan="2">Last trade</th>

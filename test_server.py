@@ -106,7 +106,7 @@ def test_state_feed_sends_every_asset_in_one_message_without_events():
         xau = live.assets["XAUUSDT"]
         xau.tracker.add_trade(100, 2, vwap.next_midnight_ms(0) - 1000, True)
         xau.last_trade = {"price": 100.0, "quantity": 2.0, "time_ms": 1, "received_ms": 2}
-        xau.first_live_ms = 1  # the engine sets both on the first live trade
+        xau.window.complete_from_ms = 1  # the engine sets both on the first live trade
         async with running_server(live) as address:
             async with websockets.connect(f"ws://{address}/ws/state") as ws:
                 state = await receive(ws)
