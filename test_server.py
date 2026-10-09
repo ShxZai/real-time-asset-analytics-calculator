@@ -15,7 +15,7 @@ import uvicorn
 import websockets
 
 import server
-import vwap
+import metrics
 
 
 @contextlib.asynccontextmanager
@@ -51,7 +51,7 @@ def get(url):
 
 def test_events_feed_sends_history_then_each_new_event():
     async def scenario():
-        live = vwap.LiveFeed()
+        live = metrics.LiveFeed()
         for n in range(3):
             live.log("info", f"before {n}")
         async with running_server(live) as address:
@@ -71,7 +71,7 @@ def test_events_feed_sends_history_then_each_new_event():
 
 def test_pages_joining_while_events_happen_miss_nothing_and_get_nothing_twice():
     async def scenario():
-        live = vwap.LiveFeed()
+        live = metrics.LiveFeed()
         total = 300
 
         async def keep_logging():
@@ -101,10 +101,10 @@ def test_pages_joining_while_events_happen_miss_nothing_and_get_nothing_twice():
 
 def test_state_feed_sends_every_asset_in_one_message_without_events():
     async def scenario():
-        live = vwap.LiveFeed(["BTCUSDT", "XAUUSDT"])
+        live = metrics.LiveFeed(["BTCUSDT", "XAUUSDT"])
         live.log("info", "something happened")
         xau = live.assets["XAUUSDT"]
-        xau.tracker.add_trade(100, 2, vwap.next_midnight_ms(0) - 1000, True)
+        xau.tracker.add_trade(100, 2, metrics.next_midnight_ms(0) - 1000, True)
         xau.last_trade = {"price": 100.0, "quantity": 2.0, "time_ms": 1, "received_ms": 2}
         xau.window.complete_from_ms = 1  # the engine sets both on the first live trade
         async with running_server(live) as address:
@@ -119,7 +119,7 @@ def test_state_feed_sends_every_asset_in_one_message_without_events():
                 assert xau_state["history"] == "waiting" and xau_state["complete"] is False
                 assert xau_state["last_trade"]["received_ms"] == 2
 
-                xau.tracker.add_trade(200, 2, vwap.next_midnight_ms(0) - 500, False)
+                xau.tracker.add_trade(200, 2, metrics.next_midnight_ms(0) - 500, False)
                 assert (await receive(ws))["assets"][1]["vwap"] == 150  # the next tick has the new value
 
     asyncio.run(scenario())
@@ -139,8 +139,8 @@ def test_bind_first_free_skips_ports_in_use():
 
 def test_missing_event_endpoint_returns_kept_events_only():
     async def scenario():
-        live = vwap.LiveFeed(["XAUUSDT"])
-        for n in range(vwap.MAX_EVENTS + 100):
+        live = metrics.LiveFeed(["XAUUSDT"])
+        for n in range(metrics.MAX_EVENTS + 100):
             live.log("info", f"event {n}")
         async with running_server(live) as address:
             assert await get(f"http://{address}/events/system/550") == (200, live.system.events[450])
@@ -154,7 +154,7 @@ def test_missing_event_endpoint_returns_kept_events_only():
 
 def test_events_with_the_same_id_from_different_logs_are_all_kept_and_found():
     async def scenario():
-        live = vwap.LiveFeed(["BTCUSDT", "XAUUSDT"])
+        live = metrics.LiveFeed(["BTCUSDT", "XAUUSDT"])
         live.log("info", "system 0")
         live.assets["BTCUSDT"].log("info", "btc 0")
         async with running_server(live) as address:
@@ -176,7 +176,7 @@ def test_events_with_the_same_id_from_different_logs_are_all_kept_and_found():
 
 def test_page_too_far_behind_is_closed_so_it_reconnects():
     async def scenario():
-        live = vwap.LiveFeed()
+        live = metrics.LiveFeed()
         async with running_server(live) as address:
             async with websockets.connect(f"ws://{address}/ws/events") as ws:
                 assert (await receive(ws))["events"] == []
@@ -192,7 +192,7 @@ def test_page_too_far_behind_is_closed_so_it_reconnects():
 
 def test_page_is_served():
     async def scenario():
-        async with running_server(vwap.LiveFeed()) as address:
+        async with running_server(metrics.LiveFeed()) as address:
             def fetch(path):
                 with urllib.request.urlopen(f"http://{address}{path}", timeout=5) as response:
                     return response.status, response.read().decode()

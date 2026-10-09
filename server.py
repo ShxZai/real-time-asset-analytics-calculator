@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from vwap import LiveFeed
+from metrics import LiveFeed
 
 HOST = "127.0.0.1"  # only this machine can open the page
 PORT = 8000  # tried first; if it's taken, the next ones up to PORT + PORT_TRIES - 1

@@ -7,7 +7,7 @@ and **XAUUSDT** (gold). One combined stream connection carries every asset's tra
 and every metric is updated on every aggregated trade. Each asset keeps its own totals,
 trade ID checks and event log, so a gap in one never touches another. You can watch it
 in the terminal or on a live web page. Adding an asset means adding its symbol to
-`SYMBOLS` in `vwap.py`.
+`SYMBOLS` in `metrics.py`.
 
 Metrics, per asset:
 
@@ -56,7 +56,7 @@ Then open the address it prints: http://127.0.0.1:8000, or the next free port
 state of every asset every 300 ms and each event as it happens over WebSockets,
 shows when Binance or the app is disconnected and how long ago each asset last
 traded, and has a debug console listing gaps, duplicates and reconnects, each
-marked with its asset (or SYSTEM for the connection). For terminal output instead, run `python vwap.py`.
+marked with its asset (or SYSTEM for the connection). For terminal output instead, run `python metrics.py`.
 
 Press Ctrl+C to stop.
 

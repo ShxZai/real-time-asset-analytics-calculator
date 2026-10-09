@@ -1,7 +1,7 @@
-"""Backtest VwapTracker on one day of Binance XAUUSDT trades.
+"""Backtest SessionTracker on one day of Binance XAUUSDT trades.
 
 Feeds every trade from the day's aggTrades archive through the same
-VwapTracker the live script uses, then compares the totals, VWAP and buy
+SessionTracker the live script uses, then compares the totals, VWAP and buy
 volume (in USDT and in coins) with Binance's official daily kline for that day.
 
 Usage: python backtest.py [YYYY-MM-DD]   (default: yesterday, UTC)
@@ -16,7 +16,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from vwap import VwapTracker
+from metrics import SessionTracker
 
 SYMBOL = "XAUUSDT"
 ARCHIVE_URL = "https://data.binance.vision/data/futures/um/daily"
@@ -60,7 +60,7 @@ def main():
     download(f"{ARCHIVE_URL}/aggTrades/{SYMBOL}/{trades_zip.name}", trades_zip)
     download(f"{ARCHIVE_URL}/klines/{SYMBOL}/1d/{kline_zip.name}", kline_zip)
 
-    tracker = VwapTracker()
+    tracker = SessionTracker()
     trade_count = 0
     for row in read_csv_rows(trades_zip):
         # is_buyer_maker true means the seller was the taker
