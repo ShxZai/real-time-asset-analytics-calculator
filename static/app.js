@@ -6,6 +6,9 @@
 //
 // Each asset and the system have their own event log with their own IDs, so the
 // console tracks the highest ID it has shown per log.
+//
+// Every volume comes in USDT ("quote") and in the coin itself ("base"). A volume cell
+// shows one large and the other small underneath; the unit switch swaps them.
 
 const RECONNECT_WAITS_MS = [1000, 2000, 4000, 5000]; // then 5 s each time
 const MAX_CONSOLE_ROWS = 500; // same as the engine keeps
@@ -20,6 +23,29 @@ let stateRetryAt = null; // when the page tries /ws/state again
 let lastEventIds = new Map(); // highest event ID shown in the console, per log
 const rows = new Map(); // symbol -> that asset's table cells
 let eventQueue = Promise.resolve(); // handles event messages one after another, in order
+let mainUnit = loadMainUnit(); // "quote" (USDT) or "base" (the coin): which volume is shown large
+
+// The unit choice is remembered in this browser only; storage can be unavailable (private windows).
+function loadMainUnit() {
+  try {
+    return localStorage.getItem("mainUnit") === "base" ? "base" : "quote";
+  } catch {
+    return "quote";
+  }
+}
+
+function setMainUnit(unit) {
+  mainUnit = unit;
+  try {
+    localStorage.setItem("mainUnit", unit);
+  } catch {
+    // not remembered; the page still switches
+  }
+  for (const button of document.querySelectorAll("#unit-switch button")) {
+    button.setAttribute("aria-pressed", String(button.dataset.unit === unit));
+  }
+  render();
+}
 
 // Change an element only when the new value differs from what it shows.
 function setText(element, text) {
@@ -79,12 +105,73 @@ function rowFor(symbol) {
       row.append(td);
       return td;
     };
-    cells = { row, symbol: cell(), price: cell(), vwap: cell(), age: cell(), volume: cell(), pressure: cell() };
+    cells = {
+      row, symbol: cell(), price: cell(), age: cell(),
+      // session (since 00:00 UTC)
+      vwap: cell(), distance: cell(), buy: cell(), sell: cell(), delta: cell(),
+      // rolling window (last 60 s)
+      rollingVwap: cell(), rollingBuy: cell(), rollingSell: cell(), rollingDelta: cell(),
+      tradeRate: cell(), volumeRate: cell(),
+    };
     cells.symbol.textContent = symbol;
+    cells.vwap.classList.add("start");
+    cells.rollingVwap.classList.add("start");
     assetRows.append(row);
     rows.set(symbol, cells);
   }
   return cells;
+}
+
+// A volume in coins: whole numbers once it's large, more decimals when it's small.
+function formatCoins(volume) {
+  const digits = Math.abs(volume) >= 1000 ? 0 : Math.abs(volume) >= 1 ? 2 : 3;
+  return volume.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+// A volume in USDT, shortened: 3.79M, 812.4K.
+function formatUsdt(volume) {
+  return volume.toLocaleString("en-US", { notation: "compact", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function signed(text, value) {
+  return value > 0 ? "+" + text : text;
+}
+
+// Show a value, or a grey italic placeholder when there isn't one yet.
+// sign: green when above 0, red when below. gap: yellow (missing trades), which wins over the sign.
+function setCell(cell, text, { placeholder = false, sign = 0, gap = false } = {}) {
+  setText(cell, text);
+  setClass(cell, "placeholder", placeholder);
+  setClass(cell, "up", !placeholder && sign > 0);
+  setClass(cell, "down", !placeholder && sign < 0);
+  setClass(cell, "gap", !placeholder && gap);
+}
+
+// A volume cell: the main unit large, the other small underneath.
+// values: {quote, base}. isDelta: add a + sign and colour green/red by the sign.
+function setVolumeCell(cell, values, asset, { isDelta = false, gap = false } = {}) {
+  let main = cell.querySelector(".main");
+  let sub = cell.querySelector(".sub");
+  if (!main) { // the cell showed a placeholder
+    main = document.createElement("span");
+    main.className = "main";
+    sub = document.createElement("span");
+    sub.className = "sub";
+    cell.replaceChildren(main, sub);
+  }
+  const text = {
+    quote: `${formatUsdt(values.quote)} ${asset.quote_asset}`,
+    base: `${formatCoins(values.base)} ${asset.base_asset}`,
+  };
+  const otherUnit = mainUnit === "quote" ? "base" : "quote";
+  // Coloured by the large number: the two units' deltas can differ in sign when buys and sells were at different prices.
+  const sign = isDelta ? values[mainUnit] : 0;
+  setText(main, isDelta ? signed(text[mainUnit], values[mainUnit]) : text[mainUnit]);
+  setText(sub, isDelta ? signed(text[otherUnit], values[otherUnit]) : text[otherUnit]);
+  setClass(cell, "placeholder", false);
+  setClass(cell, "up", sign > 0);
+  setClass(cell, "down", sign < 0);
+  setClass(cell, "gap", gap);
 }
 
 function renderAsset(asset, live) {
@@ -97,15 +184,40 @@ function renderAsset(asset, live) {
   setText(cells.age, trade ? `${Math.floor((Date.now() - trade.received_ms) / 1000)} s ago` : "none yet");
   setText(cells.price, trade ? trade.price.toFixed(2) : "-");
 
+  // Session: not shown until the startup fetch has added the earlier trades.
+  const gap = !asset.complete; // yellow while a gap is being filled
   const placeholder = { waiting: "Waiting for first trade", fetching: "Fetching data" }[asset.history];
   if (placeholder || asset.vwap === null) {
-    setText(cells.vwap, placeholder || "-");
-    setClass(cells.vwap, "placeholder", true);
-    setClass(cells.vwap, "gap", false);
+    setCell(cells.vwap, placeholder || "-", { placeholder: true });
+    for (const cell of [cells.distance, cells.buy, cells.sell, cells.delta]) setCell(cell, "-", { placeholder: true });
   } else {
-    setText(cells.vwap, asset.vwap.toFixed(2));
-    setClass(cells.vwap, "placeholder", false);
-    setClass(cells.vwap, "gap", !asset.complete); // yellow while a gap is being filled
+    const distance = asset.vwap_distance_pct;
+    setCell(cells.vwap, asset.vwap.toFixed(2), { gap });
+    setCell(cells.distance, signed(distance.toFixed(2) + "%", distance), { sign: distance, gap });
+    const flow = asset.flow;
+    setVolumeCell(cells.buy, { quote: flow.quote.buy, base: flow.base.buy }, asset, { gap });
+    setVolumeCell(cells.sell, { quote: flow.quote.sell, base: flow.base.sell }, asset, { gap });
+    setVolumeCell(cells.delta, { quote: flow.quote.delta, base: flow.base.delta }, asset, { isDelta: true, gap });
+  }
+
+  // Last 60 s: not shown until the window holds a full 60 s of trades seen live.
+  const rolling = asset.rolling;
+  if (!rolling || rolling.warmup_s > 0) {
+    setCell(cells.rollingVwap, rolling ? `Warming up (${rolling.warmup_s} s)` : "-", { placeholder: true });
+    for (const cell of [cells.rollingBuy, cells.rollingSell, cells.rollingDelta, cells.tradeRate, cells.volumeRate]) {
+      setCell(cell, "-", { placeholder: true });
+    }
+  } else {
+    // A quiet minute has no trades, so no VWAP; its volumes and rates are a real 0.
+    setCell(cells.rollingVwap, rolling.vwap === null ? "no trades" : rolling.vwap.toFixed(2),
+            { placeholder: rolling.vwap === null, gap });
+    const flow = rolling.flow;
+    setVolumeCell(cells.rollingBuy, { quote: flow.quote.buy, base: flow.base.buy }, asset, { gap });
+    setVolumeCell(cells.rollingSell, { quote: flow.quote.sell, base: flow.base.sell }, asset, { gap });
+    setVolumeCell(cells.rollingDelta, { quote: flow.quote.delta, base: flow.base.delta }, asset,
+                  { isDelta: true, gap });
+    setCell(cells.tradeRate, rolling.trades_per_s.toFixed(1), { gap });
+    setVolumeCell(cells.volumeRate, rolling.volume_per_min, asset, { gap });
   }
 }
 
@@ -215,6 +327,11 @@ keepConnected(
   (message) => { eventQueue = eventQueue.then(() => handleEventMessage(message)); },
   () => setText(el("console-status"), " - disconnected, reconnecting"),
 );
+
+for (const button of document.querySelectorAll("#unit-switch button")) {
+  button.addEventListener("click", () => setMainUnit(button.dataset.unit));
+}
+setMainUnit(mainUnit); // mark the remembered choice
 
 // Ages and countdowns change even when no message arrives.
 setInterval(render, 250);

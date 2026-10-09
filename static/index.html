@@ -48,9 +48,25 @@
     th { color: var(--muted); font-weight: normal; }
     .table-wrap { overflow-x: auto; }
 
-    td.gap { color: var(--yellow); }     /* VWAP is missing some trades while a gap is filled */
+    th.group { text-align: center; color: var(--text); }
+    .start { border-left: 1px solid var(--line); } /* first column of a group */
+
+    td.up { color: var(--green); }       /* buyers ahead, or price above VWAP */
+    td.down { color: var(--red); }
+    td.gap { color: var(--yellow); }     /* missing some trades while a gap is filled (after .up/.down so it wins) */
     tr.frozen td { color: var(--muted); } /* numbers aren't live: Binance or the app isn't connected */
     .placeholder { color: var(--muted); font-style: italic; }
+    td .main, td .sub { display: block; }
+    td .sub { font-size: 12px; opacity: 0.65; } /* the other unit, under the main one */
+
+    .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--muted); }
+    .switch { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+    .switch button {
+      font: inherit; padding: 2px 10px; border: 0; cursor: pointer;
+      background: transparent; color: var(--muted);
+    }
+    .switch button[aria-pressed="true"] { background: var(--line); color: var(--text); }
+    .switch button:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
 
     .legend { color: var(--muted); margin: 8px 0 16px; }
     .legend .swatch { color: var(--yellow); }
@@ -71,16 +87,36 @@
     <span id="binance-status" class="status">Binance: -</span>
   </header>
 
+  <div class="toolbar">
+    <span>Volume shown large:</span>
+    <span id="unit-switch" class="switch" role="group" aria-label="Volume shown large">
+      <button type="button" data-unit="quote" aria-pressed="true">USDT</button>
+      <button type="button" data-unit="base" aria-pressed="false">Coin</button>
+    </span>
+  </div>
+
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Symbol</th><th>Price</th><th>VWAP</th><th>Last trade</th><th>Volume</th><th>Buy/sell pressure</th></tr>
+        <tr>
+          <th rowspan="2">Symbol</th><th rowspan="2">Price</th><th rowspan="2">Last trade</th>
+          <th colspan="5" class="group start">Session (since 00:00 UTC)</th>
+          <th colspan="6" class="group start">Last 60 s</th>
+        </tr>
+        <tr>
+          <th class="start">VWAP</th><th>vs VWAP</th><th>Buy vol</th><th>Sell vol</th><th>Delta (CVD)</th>
+          <th class="start">VWAP</th><th>Buy vol</th><th>Sell vol</th><th>Delta</th><th>Trades/s</th><th>Vol/min</th>
+        </tr>
       </thead>
       <tbody id="assets"></tbody> <!-- one row per asset, added by app.js -->
     </table>
   </div>
   <p class="legend">
-    <span class="swatch">Yellow VWAP</span>: some trades are still being fetched after a gap; the number is usable but not final.
+    Volumes are shown in USDT (price &times; quantity) and in the coin itself (BTC, ETH, XAU = troy ounces of gold);
+    the switch above picks which is large. A buy is a trade where the buyer took a seller's resting order, a sell
+    the other way round; delta is buy volume minus sell volume (over the session: CVD).
+    Trades/s counts Binance's aggregated trades (one per taker order and price).<br>
+    <span class="swatch">Yellow numbers</span>: some trades are still being fetched after a gap; usable but not final.
     Grey numbers: not live (reconnecting, or the app is unreachable).
   </p>
 

@@ -104,8 +104,9 @@ def test_state_feed_sends_every_asset_in_one_message_without_events():
         live = vwap.LiveFeed(["BTCUSDT", "XAUUSDT"])
         live.log("info", "something happened")
         xau = live.assets["XAUUSDT"]
-        xau.tracker.add_trade(100, 2, vwap.next_midnight_ms(0) - 1000)
+        xau.tracker.add_trade(100, 2, vwap.next_midnight_ms(0) - 1000, True)
         xau.last_trade = {"price": 100.0, "quantity": 2.0, "time_ms": 1, "received_ms": 2}
+        xau.first_live_ms = 1  # the engine sets both on the first live trade
         async with running_server(live) as address:
             async with websockets.connect(f"ws://{address}/ws/state") as ws:
                 state = await receive(ws)
@@ -118,10 +119,22 @@ def test_state_feed_sends_every_asset_in_one_message_without_events():
                 assert xau_state["history"] == "waiting" and xau_state["complete"] is False
                 assert xau_state["last_trade"]["received_ms"] == 2
 
-                xau.tracker.add_trade(200, 2, vwap.next_midnight_ms(0) - 500)
+                xau.tracker.add_trade(200, 2, vwap.next_midnight_ms(0) - 500, False)
                 assert (await receive(ws))["assets"][1]["vwap"] == 150  # the next tick has the new value
 
     asyncio.run(scenario())
+
+
+def test_bind_first_free_skips_ports_in_use():
+    taken = server.bind_first_free(range(20000, 20100))
+    taken_port = taken.getsockname()[1]
+    try:
+        sock = server.bind_first_free([taken_port, taken_port + 1, taken_port + 2])
+        assert sock.getsockname()[1] in (taken_port + 1, taken_port + 2)  # not the taken one
+        sock.close()
+        assert server.bind_first_free([taken_port]) is None  # only a taken port: none free
+    finally:
+        taken.close()
 
 
 def test_missing_event_endpoint_returns_kept_events_only():

@@ -1,10 +1,19 @@
-"""Live VWAP for several Binance USD-M futures (BTCUSDT, ETHUSDT, XAUUSDT).
+"""Live VWAP and order flow for several Binance USD-M futures (BTCUSDT, ETHUSDT, XAUUSDT).
 
 The engine (LiveFeed) keeps its state and lists of events instead of printing, so a
 display can follow it. Running this file shows it in the terminal.
 
 One combined stream connection carries every asset's trades. Each asset has its own
-AssetTracker (VWAP totals, ID checks, fetches, event log); they share the formulas.
+AssetTracker (session totals, rolling window, ID checks, fetches, event log); they share the formulas.
+
+Each asset has two sets of metrics:
+- session (since 00:00 UTC): VWAP, distance of the price from it, and buy and sell
+  volume with their difference (delta; over the session this is CVD).
+- rolling (the last ROLLING_WINDOW_S seconds): VWAP, buy and sell volume, delta,
+  trades per second and volume per minute.
+A trade counts as a buy when the buyer was the taker (hit the ask), as a sell when
+the seller was (Binance's "m" flag: buyer is maker). Every volume is kept twice: in
+USDT (price x quantity, the quote asset) and in the coin itself (the base asset).
 
 VWAP resets at 00:00 UTC each day. When the program starts mid-session, it fetches
 the session's earlier trades from the REST API (1m candles, then aggTrades up to the
@@ -34,9 +43,11 @@ REST_URL = "https://fapi.binance.com"
 # message wrapped as {"stream": "btcusdt@aggTrade", "data": {...trade, "s": "BTCUSDT"}}.
 STREAM_BASE_URL = "wss://fstream.binance.com/market/stream?streams="
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"]  # adding an asset = adding its symbol here
+QUOTE_ASSET = "USDT"  # every symbol is priced in this; the rest of the name is the coin (base asset)
 
 MINUTE_MS = 60 * 1000
 DAY_MS = 24 * 60 * MINUTE_MS
+ROLLING_WINDOW_S = 60  # every rolling metric covers this many seconds
 MAX_RETRY_WAIT_S = 60
 # Trade times past this are treated as corrupt (datetime can't handle times that far off).
 MAX_TRADE_TIME_MS = int(datetime(3000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
@@ -76,37 +87,97 @@ def next_midnight_ms(trade_time_ms):
     return int(midnight.timestamp() * 1000)
 
 
+def trade_totals(price, quantity, is_buy):
+    """One trade as (pv, volume, buy_pv, buy_volume): its value in USDT and in coins, and the buy part of each."""
+    pv = price * quantity
+    return (pv, quantity, pv, quantity) if is_buy else (pv, quantity, 0.0, 0.0)
+
+
 class VwapTracker:
-    """Keeps the running totals for one session and the VWAP derived from them."""
+    """Keeps the running totals for one session and the VWAP derived from them.
+
+    cumulative_pv is also the session's volume in USDT. Sell volume isn't kept:
+    it's the total minus the buy part (cumulative_pv - buy_pv, and the same in coins).
+    """
 
     def __init__(self):
         self.cumulative_pv = 0.0
         self.cumulative_volume = 0.0
+        self.buy_pv = 0.0  # USDT volume of trades where the buyer was the taker
+        self.buy_volume = 0.0  # the same in coins
         self.vwap = None  # None means no trades yet this session (shown as NA)
         self.next_reset_ms = None  # set by the first trade
 
-    def add_trade(self, price, quantity, trade_time_ms):
+    def add_trade(self, price, quantity, trade_time_ms, is_buy):
         """Add one trade and recalculate VWAP. Returns True if a new session started."""
         new_session = self.next_reset_ms is None or trade_time_ms >= self.next_reset_ms
         if new_session:
             self.cumulative_pv = 0.0
             self.cumulative_volume = 0.0
+            self.buy_pv = 0.0
+            self.buy_volume = 0.0
             self.vwap = None
             self.next_reset_ms = next_midnight_ms(trade_time_ms)
 
-        self.add_totals(price * quantity, quantity)
+        self.add_totals(*trade_totals(price, quantity, is_buy))
         return new_session
 
-    def add_totals(self, pv, volume):
+    def add_totals(self, pv, volume, buy_pv, buy_volume):
         """Add already-summed totals (e.g. from candles) and recalculate VWAP."""
         self.cumulative_pv += pv
         self.cumulative_volume += volume
+        self.buy_pv += buy_pv
+        self.buy_volume += buy_volume
         if self.cumulative_volume > 0:
             self.vwap = self.cumulative_pv / self.cumulative_volume
 
     def in_session(self, trade_time_ms):
         """True if a trade time falls in the current session (used for late and fetched trades)."""
         return self.next_reset_ms is not None and trade_time_ms >= self.next_reset_ms - DAY_MS
+
+
+class RollingWindow:
+    """Totals of the trades in the last ROLLING_WINDOW_S seconds, by trade time.
+
+    Trades are kept in one-second buckets, so a trade that arrives late or is fetched
+    after a gap still lands in its own second, and summing the window stays cheap.
+    The window is the current second and the ROLLING_WINDOW_S - 1 before it.
+    """
+
+    def __init__(self):
+        self.buckets = {}  # trade time in whole seconds -> [pv, volume, buy_pv, buy_volume, trade_count]
+        self.newest_s = None
+
+    def add(self, price, quantity, trade_time_ms, is_buy):
+        second = trade_time_ms // 1000
+        if self.newest_s is not None and second <= self.newest_s - ROLLING_WINDOW_S:
+            return  # already outside the window
+        bucket = self.buckets.setdefault(second, [0.0, 0.0, 0.0, 0.0, 0])
+        for i, value in enumerate(trade_totals(price, quantity, is_buy)):
+            bucket[i] += value
+        bucket[4] += 1
+        if self.newest_s is None or second > self.newest_s:
+            self.newest_s = second
+            for old in [s for s in self.buckets if s <= second - ROLLING_WINDOW_S]:
+                del self.buckets[old]
+
+    def totals(self, now_ms):
+        """Sum the window ending at now_ms (Binance's time): [pv, volume, buy_pv, buy_volume, trade_count]."""
+        first_s = now_ms // 1000 - ROLLING_WINDOW_S + 1
+        sums = [0.0, 0.0, 0.0, 0.0, 0]
+        for second, bucket in self.buckets.items():
+            if second >= first_s:
+                for i, value in enumerate(bucket):
+                    sums[i] += value
+        return sums
+
+
+def order_flow(pv, volume, buy_pv, buy_volume):
+    """Buy volume, sell volume and delta (buy minus sell), in USDT ("quote") and in coins ("base")."""
+    def one_unit(total, buy):
+        sell = total - buy
+        return {"buy": buy, "sell": sell, "delta": buy - sell}
+    return {"quote": one_unit(pv, buy_pv), "base": one_unit(volume, buy_volume)}
 
 
 class TradeIdChecker:
@@ -246,20 +317,28 @@ def check_trade(trade):
     for key in ("p", "q"):
         if not is_number(trade.get(key), 0) or float(trade[key]) == 0:
             raise ValueError(f"field {key!r} missing or not a positive number: {trade!r:.200}")
+    if not isinstance(trade.get("m"), bool):
+        raise ValueError(f"field 'm' missing or not true/false: {trade!r:.200}")
+
+
+def is_buy(trade):
+    """True if the buyer was the taker. "m" means the buyer was the maker, so the seller took."""
+    return not trade["m"]
 
 
 def check_candle(candle):
-    """Raise ValueError unless a 1m kline row has the fields VWAP needs.
+    """Raise ValueError unless a 1m kline row has the fields the session totals need.
 
-    A row is [open time, open, high, low, close, volume, close time, quote volume, ...].
-    Volume can be 0 in a minute with no trades.
+    A row is [open time, open, high, low, close, volume, close time, quote volume,
+    trade count, taker buy volume, taker buy quote volume, ...]. Volume can be 0 in a
+    minute with no trades.
     """
-    if not isinstance(candle, list) or len(candle) < 8:
+    if not isinstance(candle, list) or len(candle) < 11:
         raise ValueError(f"not a kline row: {candle!r:.200}")
     if not (is_whole_number(candle[0], 0, MAX_TRADE_TIME_MS) and is_whole_number(candle[6], 0, MAX_TRADE_TIME_MS)):
         raise ValueError(f"kline open or close time isn't a possible time: {candle!r:.200}")
-    if not (is_number(candle[5], 0) and is_number(candle[7], 0)):
-        raise ValueError(f"kline volume or quote volume isn't a number: {candle!r:.200}")
+    if not all(is_number(candle[i], 0) for i in (5, 7, 9, 10)):
+        raise ValueError(f"kline volume, quote volume or taker buy volumes aren't numbers: {candle!r:.200}")
 
 
 def check_list(response, path):
@@ -292,12 +371,11 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
 
     1m candles cover the session start up to the start of the first live trade's
     minute (not including it). aggTrades cover that minute up to, but not including,
-    the first live trade. Returns (pv, volume, candle_count, trade_count).
+    the first live trade. Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count).
     """
     first_live_id = first_trade["a"]
     minute_start_ms = first_trade["T"] - first_trade["T"] % MINUTE_MS
-    pv = 0.0
-    volume = 0.0
+    totals = [0.0, 0.0, 0.0, 0.0]  # pv, volume, buy_pv, buy_volume
 
     candle_count = 0
     if minute_start_ms > session_start_ms:
@@ -311,8 +389,9 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
             open_time_ms, close_time_ms = candle[0], candle[6]
             if open_time_ms < session_start_ms or close_time_ms >= minute_start_ms:
                 continue  # outside the session, or the still-open candle
-            volume += float(candle[5])
-            pv += float(candle[7])  # quote volume = sum of price x quantity
+            # quote volume (= sum of price x quantity), volume, taker buy quote volume, taker buy volume
+            for i, column in enumerate((7, 5, 10, 9)):
+                totals[i] += float(candle[column])
             candle_count += 1
 
     trade_count = 0
@@ -327,11 +406,9 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
         for trade in trades:
             check_trade(trade)
             if trade["a"] >= first_live_id:
-                return pv, volume, candle_count, trade_count
-            price = float(trade["p"])
-            quantity = float(trade["q"])
-            pv += price * quantity
-            volume += quantity
+                return *totals, candle_count, trade_count
+            for i, value in enumerate(trade_totals(float(trade["p"]), float(trade["q"]), is_buy(trade))):
+                totals[i] += value
             trade_count += 1
         params = {"symbol": symbol, "fromId": trades[-1]["a"] + 1, "limit": 1000}
 
@@ -341,22 +418,23 @@ async def backfill(symbol, tracker, first_trade, log):
     session_reset_ms = tracker.next_reset_ms
     session_start_ms = session_reset_ms - DAY_MS
     log("info", f"Fetching earlier trades since {format_time(session_start_ms)} UTC")
-    pv, volume, candle_count, trade_count = await fetch_earlier_trades(symbol, session_start_ms, first_trade, log)
+    *totals, candle_count, trade_count = await fetch_earlier_trades(symbol, session_start_ms, first_trade, log)
 
     if tracker.next_reset_ms != session_reset_ms:
         log("info", "A new session started before the fetch finished; discarding the fetched trades")
         return
-    tracker.add_totals(pv, volume)
+    tracker.add_totals(*totals)
     log("info", f"Added {candle_count} one-minute candles and {trade_count} trades. "
                 f"Full-session VWAP {format_vwap(tracker.vwap)}")
 
 
-async def fetch_gap(symbol, tracker, checker, first_id, last_id, log):
+async def fetch_gap(symbol, tracker, window, checker, first_id, last_id, log):
     """Fetch the trades in one gap from REST and add those still missing to the totals.
 
     A fetched trade is only counted if its ID is still in the missing set, so a trade
     that also arrives late on the stream is never counted twice. Trades from before
-    the current session are dropped.
+    the current session are dropped from the session totals; the rolling window takes
+    any trade recent enough, whichever session it's in.
     """
     added = dropped = 0
     from_id = first_id
@@ -372,9 +450,10 @@ async def fetch_gap(symbol, tracker, checker, first_id, last_id, log):
                 break
             if not checker.claim(trade["a"]):
                 continue  # already arrived late on the stream
+            price, quantity = float(trade["p"]), float(trade["q"])
+            window.add(price, quantity, trade["T"], is_buy(trade))
             if tracker.in_session(trade["T"]):
-                quantity = float(trade["q"])
-                tracker.add_totals(float(trade["p"]) * quantity, quantity)
+                tracker.add_totals(*trade_totals(price, quantity, is_buy(trade)))
                 added += 1
             else:
                 dropped += 1
@@ -428,7 +507,7 @@ class EventLog:
 
 
 class AssetTracker:
-    """Everything one asset keeps for itself: VWAP totals, ID checks, fetches, last trade, events.
+    """Everything one asset keeps for itself: session totals, rolling window, ID checks, fetches, last trade, events.
 
     Every asset uses the same formulas (VwapTracker, TradeIdChecker, the fetch
     functions) but has its own numbers, so a gap in one asset never touches another.
@@ -440,7 +519,9 @@ class AssetTracker:
         self.on_trade = on_trade  # called with the symbol after each new live trade is counted
         self.event_log = EventLog(symbol, on_event)
         self.tracker = VwapTracker()
+        self.window = RollingWindow()
         self.checker = TradeIdChecker()
+        self.first_live_ms = None  # time of the first live trade; the window is full 60 s after it
         self.backfill_task = None
         self.fetch_tasks = set()  # keeps running fetch tasks referenced until they finish
         self.last_trade = None  # the latest new live trade: price, quantity, time_ms, received_ms
@@ -458,19 +539,58 @@ class AssetTracker:
         """True if VWAP includes every trade so far: startup fetch done and no IDs missing."""
         return self.history_state() == "done" and not self.checker.missing_ids
 
+    def binance_now_ms(self):
+        """Binance's time now, estimated as the last trade's time plus how long ago it arrived.
+
+        Comparing trade times with this PC's clock directly would be off by however
+        far the two clocks differ. Needs a last trade.
+        """
+        return self.last_trade["time_ms"] + now_ms() - self.last_trade["received_ms"]
+
+    def rolling_snapshot(self):
+        """The rolling window's metrics, or None before the first trade.
+
+        "warmup_s" is how many seconds are left until the window holds a full
+        ROLLING_WINDOW_S of trades seen live (0 once it does); until then the window
+        is missing the trades from before the app started, so its numbers are too low.
+        """
+        if self.last_trade is None:
+            return None
+        binance_now_ms = self.binance_now_ms()
+        pv, volume, buy_pv, buy_volume, trade_count = self.window.totals(binance_now_ms)
+        full_at_s = self.first_live_ms // 1000 + ROLLING_WINDOW_S
+        return {
+            "warmup_s": max(0, full_at_s - binance_now_ms // 1000),
+            "vwap": pv / volume if volume > 0 else None,
+            "volume_per_min": {"quote": pv * 60 / ROLLING_WINDOW_S, "base": volume * 60 / ROLLING_WINDOW_S},
+            "trades_per_s": trade_count / ROLLING_WINDOW_S,
+            "flow": order_flow(pv, volume, buy_pv, buy_volume),
+        }
+
     def snapshot(self):
         """This asset's state as plain copied values (no await, so always consistent)."""
         session_start_ms = None
         if self.tracker.next_reset_ms is not None:
             session_start_ms = self.tracker.next_reset_ms - DAY_MS
+        vwap = self.tracker.vwap
+        distance_pct = None
+        if vwap is not None and self.last_trade is not None:
+            distance_pct = (self.last_trade["price"] - vwap) / vwap * 100
+        tracker = self.tracker
         return {
             "symbol": self.symbol,
+            "base_asset": self.symbol.removesuffix(QUOTE_ASSET),  # the coin: BTC, ETH, XAU
+            "quote_asset": QUOTE_ASSET,
             "history": self.history_state(),
             "complete": self.is_complete(),
             "missing_count": len(self.checker.missing_ids),
             "session_start_ms": session_start_ms,
             "last_trade": dict(self.last_trade) if self.last_trade else None,
-            "vwap": self.tracker.vwap,
+            "vwap": vwap,
+            "vwap_distance_pct": distance_pct,  # how far the last price is above (+) or below (-) VWAP
+            # delta here is CVD
+            "flow": order_flow(tracker.cumulative_pv, tracker.cumulative_volume, tracker.buy_pv, tracker.buy_volume),
+            "rolling": self.rolling_snapshot(),
         }
 
     def start_task(self, name, function, *args):
@@ -484,31 +604,35 @@ class AssetTracker:
         price = float(trade["p"])
         quantity = float(trade["q"])
         trade_time_ms = trade["T"]
+        buy = is_buy(trade)
 
         kind, gap = self.checker.check(trade["a"])
         if kind == "duplicate":
             self.log("warning", f"Duplicate trade {trade['a']} ignored")
             return
         if kind == "late":
+            self.window.add(price, quantity, trade_time_ms, buy)
             if self.tracker.in_session(trade_time_ms):
-                self.tracker.add_totals(price * quantity, quantity)
+                self.tracker.add_totals(*trade_totals(price, quantity, buy))
                 self.log("info", f"Late trade {trade['a']} arrived and was added")
             return
 
-        if self.tracker.add_trade(price, quantity, trade_time_ms):
+        self.window.add(price, quantity, trade_time_ms, buy)
+        if self.tracker.add_trade(price, quantity, trade_time_ms, buy):
             session_date = datetime.fromtimestamp(trade_time_ms / 1000, tz=timezone.utc).date()
             self.log("info", f"New session: {session_date} (UTC)")
         self.last_trade = {"price": price, "quantity": quantity, "time_ms": trade_time_ms, "received_ms": now_ms()}
 
         # The first live trade sets the session, so the startup fetch can start now.
         if self.backfill_task is None:
+            self.first_live_ms = trade_time_ms
             self.backfill_task = self.start_task("Fetching earlier trades", backfill,
                                                  self.symbol, self.tracker, trade, self.log)
         if gap is not None:
             first_id, last_id = gap
             self.log("info", f"Gap: {last_id - first_id + 1} trades missing (IDs {first_id}-{last_id}); fetching from REST")
             self.start_task(f"Fetching gap {first_id}-{last_id}", fetch_gap,
-                            self.symbol, self.tracker, self.checker, first_id, last_id, self.log)
+                            self.symbol, self.tracker, self.window, self.checker, first_id, last_id, self.log)
 
         if self.on_trade:
             self.on_trade(self.symbol)

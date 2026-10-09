@@ -22,9 +22,16 @@ import vwap
 MIDNIGHT_MS = vwap.next_midnight_ms(1_791_000_000_000)  # 00:00 UTC on 2026-10-04
 
 
-def make_trade(trade_id, price, trade_time_ms, quantity=1, symbol="XAUUSDT"):
+def make_trade(trade_id, price, trade_time_ms, quantity=1, symbol="XAUUSDT", is_buy=True):
     """A trade shaped like Binance's aggTrade (numbers sent as text, like the real one)."""
-    return {"e": "aggTrade", "s": symbol, "a": trade_id, "p": str(price), "q": str(quantity), "T": trade_time_ms}
+    return {"e": "aggTrade", "s": symbol, "a": trade_id, "p": str(price), "q": str(quantity),
+            "T": trade_time_ms, "m": not is_buy}
+
+
+def make_candle(open_time_ms, volume, quote_volume, buy_volume, buy_quote_volume):
+    """A 1m kline row shaped like Binance's (numbers sent as text)."""
+    return [open_time_ms, "1", "1", "1", "1", str(volume), open_time_ms + vwap.MINUTE_MS - 1,
+            str(quote_volume), 0, str(buy_volume), str(buy_quote_volume), "0"]
 
 
 def fake_rest(trades):
@@ -307,11 +314,59 @@ def test_snapshot_before_the_first_trade_is_empty_and_waiting():
     for asset in snapshot["assets"]:
         assert asset["history"] == "waiting"
         assert asset["vwap"] is None and asset["last_trade"] is None and asset["session_start_ms"] is None
+        assert asset["vwap_distance_pct"] is None and asset["rolling"] is None
+        assert asset["flow"]["quote"] == {"buy": 0, "sell": 0, "delta": 0}
+    assert [(a["base_asset"], a["quote_asset"]) for a in snapshot["assets"]] == [
+        ("BTC", "USDT"), ("ETH", "USDT"), ("XAU", "USDT")]
+
+
+def test_rolling_window_counts_the_last_60_seconds_by_trade_time():
+    w = vwap.RollingWindow()
+    w.add(100, 1, 10_000, True)  # second 10
+    w.add(200, 2, 69_500, False)  # second 69
+    # [pv, volume, buy_pv, buy_volume, trade_count]
+    assert w.totals(69_999) == [500, 3, 100, 1, 2]  # seconds 10-69
+    assert w.totals(70_000) == [400, 2, 0, 0, 1]  # seconds 11-70: second 10 has left
+    w.add(300, 1, 10_100, True)  # late, but second 10 is still kept
+    w.add(150, 2, 69_000, True)  # out of order: lands in its own second
+    assert w.totals(69_999) == [1100, 6, 700, 4, 4]
+    w.add(100, 1, 71_000, True)  # the window moves past seconds 10 and 11, which are dropped
+    assert 10 not in w.buckets
+    w.add(999, 1, 11_000, True)  # too old to be in any window from now on: ignored
+    assert w.totals(71_000) == [800, 5, 400, 3, 3]
+    assert w.totals(200_000) == [0, 0, 0, 0, 0]  # quiet market: the window empties with time
+
+
+def test_rolling_metrics_warm_up_for_60_seconds_after_the_first_live_trade():
+    asset = vwap.AssetTracker("XAUUSDT")
+    asset.first_live_ms = 1_000_500
+    asset.window.add(100, 1, 1_000_500, True)
+    asset.last_trade = {"price": 100, "quantity": 1, "time_ms": 1_020_200, "received_ms": vwap.now_ms()}
+    # Binance's time is about 1 020 200: second 1020, and the window is full from second 1060.
+    assert asset.rolling_snapshot()["warmup_s"] == 40
+
+
+def test_startup_fetch_sums_buy_volume_from_candles_and_trades(monkeypatch):
+    first_live = make_trade(12, 100, MIDNIGHT_MS + 2 * vwap.MINUTE_MS + 500)
+    candles = [make_candle(MIDNIGHT_MS, 5, 500, 2, 200), make_candle(MIDNIGHT_MS + vwap.MINUTE_MS, 0, 0, 0, 0)]
+    trades = [make_trade(10, 100, first_live["T"] - 200, quantity=2, is_buy=False),
+              make_trade(11, 100, first_live["T"] - 100, quantity=3), first_live]
+    rest = fake_rest(trades)
+
+    async def get_json(path, params, log):
+        return candles if path == "/fapi/v1/klines" else await rest(path, params, log)
+
+    monkeypatch.setattr(vwap, "get_json", get_json)
+    result = asyncio.run(vwap.fetch_earlier_trades("XAUUSDT", MIDNIGHT_MS, first_live, lambda *_: None))
+    # pv, volume, buy pv (200 + 300), buy volume (2 + 3), candles, trades
+    assert result == (1000, 10, 500, 5, 2, 2)
 
 
 def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
-    t = MIDNIGHT_MS + 60_000
-    trades = [make_trade(i, 100 + i, t + i) for i in range(4)]
+    t = MIDNIGHT_MS + 80_000
+    # Quantities 1-4; trades 1 and 3 are sells. Trade 0 is 70 s older than the rest.
+    trades = [make_trade(i, 100 + i, t + i - (70_000 if i == 0 else 0), quantity=i + 1, is_buy=i % 2 == 0)
+              for i in range(4)]
     monkeypatch.setattr(vwap, "get_json", fake_rest(trades))
     fake = FakeBinance([[trades[0]], [trades[3]]])  # gap 1-2 across a reconnect
 
@@ -324,7 +379,22 @@ def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
     assert asset["history"] == "done" and asset["missing_count"] == 0
     assert asset["session_start_ms"] == MIDNIGHT_MS
     assert asset["last_trade"]["price"] == 103 and asset["last_trade"]["time_ms"] == t + 3
-    assert math.isclose(asset["vwap"], 101.5)  # (100 + 101 + 102 + 103) / 4
+    session_vwap = (100 * 1 + 101 * 2 + 102 * 3 + 103 * 4) / 10
+    assert math.isclose(asset["vwap"], session_vwap)
+    assert math.isclose(asset["vwap_distance_pct"], (103 - session_vwap) / session_vwap * 100)
+    # Buys are trades 0 and 2: 100 x 1 + 102 x 3 = 406 USDT, 1 + 3 = 4 coins.
+    assert asset["flow"]["quote"] == {"buy": 406, "sell": 1020 - 406, "delta": 406 - 614}
+    assert asset["flow"]["base"] == {"buy": 4, "sell": 6, "delta": -2}
+
+    # Trade 0 is outside the last 60 s, so the rolling window has only trades 1-3 (the gap fill
+    # included). The first live trade was 70 s before the last, so the window is already full.
+    rolling = asset["rolling"]
+    assert rolling["warmup_s"] == 0
+    assert math.isclose(rolling["vwap"], (101 * 2 + 102 * 3 + 103 * 4) / 9)
+    assert rolling["flow"]["quote"] == {"buy": 306, "sell": 614, "delta": -308}
+    assert rolling["flow"]["base"] == {"buy": 3, "sell": 6, "delta": -3}
+    assert rolling["volume_per_min"] == {"quote": 920, "base": 9}
+    assert rolling["trades_per_s"] == 3 / 60
 
     # The gap is in the XAUUSDT log; connection events are in the system log.
     messages = [e["message"] for e in xau(live).event_log.events]
@@ -394,16 +464,18 @@ def test_check_trade_rejects_values_that_would_break_vwap():
     good = make_trade(7, 100, MIDNIGHT_MS)
     vwap.check_trade(good)
     bad_fields = [{"a": True}, {"a": -1}, {"a": 7.0}, {"T": -5}, {"T": vwap.MAX_TRADE_TIME_MS},
-                  {"p": "0"}, {"p": "inf"}, {"q": "-1"}, {"q": None}]
+                  {"p": "0"}, {"p": "inf"}, {"q": "-1"}, {"q": None}, {"m": None}, {"m": "false"}]
     for bad in bad_fields:
         with pytest.raises(ValueError):
             vwap.check_trade({**good, **bad})
 
 
 def test_check_candle_allows_quiet_minutes_but_not_broken_numbers():
-    candle = [MIDNIGHT_MS, "1", "1", "1", "1", "0", MIDNIGHT_MS + 59_999, "0", 0]  # no trades that minute
+    candle = make_candle(MIDNIGHT_MS, 0, 0, 0, 0)  # no trades that minute
     vwap.check_candle(candle)
-    for index, bad in [(5, "nan"), (7, "abc"), (6, None)]:
+    with pytest.raises(ValueError):
+        vwap.check_candle(candle[:10])  # no taker buy quote volume
+    for index, bad in [(5, "nan"), (7, "abc"), (6, None), (9, "-1"), (10, "x")]:
         with pytest.raises(ValueError):
             vwap.check_candle(candle[:index] + [bad] + candle[index + 1:])
     with pytest.raises(ValueError):
@@ -451,13 +523,16 @@ def official_totals(session_start_ms, boundary_ms):
         "symbol": LIVE_SYMBOL, "interval": "1m", "limit": 1500,
         "startTime": session_start_ms, "endTime": boundary_ms - 1})
     candles = [c for c in candles if c[6] < boundary_ms]
-    return sum(float(c[7]) for c in candles), sum(float(c[5]) for c in candles)
+    # pv, volume, taker buy quote volume, taker buy volume
+    return [sum(float(c[i]) for c in candles) for i in (7, 5, 10, 9)]
 
 
 def assert_matches_official(tracker, boundary_ms):
-    pv, volume = official_totals(tracker.next_reset_ms - vwap.DAY_MS, boundary_ms)
+    pv, volume, buy_pv, buy_volume = official_totals(tracker.next_reset_ms - vwap.DAY_MS, boundary_ms)
     assert math.isclose(tracker.cumulative_pv, pv, rel_tol=1e-9)
     assert math.isclose(tracker.cumulative_volume, volume, rel_tol=1e-9)
+    assert math.isclose(tracker.buy_pv, buy_pv, rel_tol=1e-9)
+    assert math.isclose(tracker.buy_volume, buy_volume, rel_tol=1e-9)
     assert math.isclose(tracker.vwap, pv / volume, rel_tol=1e-9)
 
 

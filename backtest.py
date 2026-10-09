@@ -1,8 +1,8 @@
 """Backtest VwapTracker on one day of Binance XAUUSDT trades.
 
 Feeds every trade from the day's aggTrades archive through the same
-VwapTracker the live script uses, then compares the totals and VWAP with
-Binance's official daily kline for that day.
+VwapTracker the live script uses, then compares the totals, VWAP and buy
+volume (in USDT and in coins) with Binance's official daily kline for that day.
 
 Usage: python backtest.py [YYYY-MM-DD]   (default: yesterday, UTC)
 """
@@ -63,19 +63,25 @@ def main():
     tracker = VwapTracker()
     trade_count = 0
     for row in read_csv_rows(trades_zip):
-        tracker.add_trade(float(row["price"]), float(row["quantity"]), int(row["transact_time"]))
+        # is_buyer_maker true means the seller was the taker
+        is_buy = row["is_buyer_maker"].lower() == "false"
+        tracker.add_trade(float(row["price"]), float(row["quantity"]), int(row["transact_time"]), is_buy)
         trade_count += 1
 
     kline = next(read_csv_rows(kline_zip))
     official_pv = float(kline["quote_volume"])
     official_volume = float(kline["volume"])
     official_vwap = official_pv / official_volume
+    official_buy_volume = float(kline["taker_buy_volume"])
+    official_buy_pv = float(kline["taker_buy_quote_volume"])
 
     print(f"{SYMBOL} {day} (UTC): {trade_count} aggregated trades, tolerance {REL_TOL:g} relative\n")
     results = [
         compare("cumulative_pv", tracker.cumulative_pv, official_pv),
         compare("cumulative_volume", tracker.cumulative_volume, official_volume),
         compare("vwap", tracker.vwap, official_vwap),
+        compare("buy_volume", tracker.buy_volume, official_buy_volume),
+        compare("buy_pv", tracker.buy_pv, official_buy_pv),
     ]
     print("\nAll checks passed." if all(results) else "\nSome checks FAILED.")
 

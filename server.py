@@ -1,6 +1,7 @@
 """Web page for the live VWAP engine (several assets on one Binance connection).
 
-Run `python server.py`, then open http://127.0.0.1:8000 in a browser.
+Run `python server.py`, then open the address it prints in a browser. It uses port
+8000, or the next free one if another program has it; `--port N` asks for exactly N.
 
 One engine runs for the whole program, in the same asyncio loop as the server, so
 every open page shares one Binance connection. A page opens two WebSockets:
@@ -15,8 +16,10 @@ is named by (symbol, id). GET /events/{symbol}/{id} returns one event that's sti
 kept ("system" for the system log), so a page can fetch an ID it didn't receive.
 """
 
+import argparse
 import asyncio
 import contextlib
+import socket
 from pathlib import Path
 
 import uvicorn
@@ -27,7 +30,8 @@ from fastapi.staticfiles import StaticFiles
 from vwap import LiveFeed
 
 HOST = "127.0.0.1"  # only this machine can open the page
-PORT = 8000
+PORT = 8000  # tried first; if it's taken, the next ones up to PORT + PORT_TRIES - 1
+PORT_TRIES = 20
 STATE_INTERVAL_S = 0.3
 # A page this many events behind is cut off; it reconnects and rebuilds from history.
 PAGE_QUEUE_SIZE = 1000
@@ -158,10 +162,43 @@ async def send_until_closed(ws, send):
             sender.result()
 
 
+def bind_first_free(ports):
+    """Return a socket listening on the first of these ports that's free, or None if none is.
+
+    The socket is handed to the server as it is, so no other program can take the
+    port between checking it and using it. SO_REUSEADDR isn't set: on Windows it
+    would let this server share a port another program is already using.
+    """
+    for port in ports:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((HOST, port))
+            sock.listen()
+            return sock
+        except OSError:  # in use (or not allowed)
+            sock.close()
+    return None
+
+
 def main():
-    app = create_app(LiveFeed())
-    print(f"Open http://{HOST}:{PORT} in a browser. Press Ctrl+C to stop.")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    parser = argparse.ArgumentParser(description="Serve the live asset analytics page.")
+    parser.add_argument("--port", type=int,
+                        help=f"use exactly this port (default: {PORT}, or the next free one)")
+    args = parser.parse_args()
+
+    ports = [args.port] if args.port is not None else range(PORT, PORT + PORT_TRIES)
+    sock = bind_first_free(ports)
+    if sock is None:
+        if args.port is not None:
+            raise SystemExit(f"Port {args.port} is in use by another program. Pick another with --port N.")
+        raise SystemExit(f"Ports {PORT}-{PORT + PORT_TRIES - 1} are all in use. Close a program, or pick a port with --port N.")
+
+    port = sock.getsockname()[1]
+    if args.port is None and port != PORT:
+        print(f"Port {PORT} is in use by another program, so using {port} instead.")
+    print(f"Open http://{HOST}:{port} in a browser. Press Ctrl+C to stop.")
+    config = uvicorn.Config(create_app(LiveFeed()), log_level="warning")
+    uvicorn.Server(config).run(sockets=[sock])
 
 
 if __name__ == "__main__":
