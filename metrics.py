@@ -6,12 +6,18 @@ display can follow it. Running this file shows it in the terminal.
 One combined stream connection carries every asset's trades. Each asset has its own
 AssetTracker (session totals, rolling window, ID checks, fetches, event log); they share the formulas.
 
-Each asset has two sets of metrics:
-- session (since 00:00 UTC): VWAP, distance of the price from it, and buy and sell
-  volume with their difference (delta; over the session this is CVD).
+Each asset has three sets of metrics:
+- session (since 00:00 UTC): change of the price since the session's first trade, VWAP,
+  distance of the price from it, and buy and sell volume with their difference (delta;
+  over the session this is CVD).
 - rolling (the last ROLLING_WINDOW_S seconds): VWAP, buy and sell volume, delta,
   trades per second and volume per minute. At startup a separate fetch brings the
   minute before the first live trade, so the window is full within seconds.
+- volatility (the last VOLATILITY_WINDOW_MIN minutes): the standard deviation of
+  one-minute log returns, annualized (x the square root of the minutes in a 365-day
+  year, as crypto trades every day) and shown in percent. It uses each finished
+  minute's last price; a minute with no trades keeps the previous one. At startup a
+  fetch of 1m candles brings the hour before, so it's full at once.
 A trade counts as a buy when the buyer was the taker (hit the ask), as a sell when
 the seller was (Binance's "m" flag: buyer is maker). Every volume is kept twice: in
 USDT (price x quantity, the quote asset) and in the coin itself (the base asset).
@@ -49,6 +55,8 @@ QUOTE_ASSET = "USDT"  # every symbol is priced in this; the rest of the name is 
 MINUTE_MS = 60 * 1000
 DAY_MS = 24 * 60 * MINUTE_MS
 ROLLING_WINDOW_S = 60  # every rolling metric covers this many seconds
+VOLATILITY_WINDOW_MIN = 60  # volatility uses this many one-minute returns
+MINUTES_PER_YEAR = 365 * 24 * 60  # for annualizing; crypto (and Binance's gold) trades every day
 MAX_RETRY_WAIT_S = 60
 # Trade times past this are treated as corrupt (datetime can't handle times that far off).
 MAX_TRADE_TIME_MS = int(datetime(3000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
@@ -108,6 +116,10 @@ class SessionTracker:
         self.buy_volume = 0.0  # the same in coins
         self.vwap = None  # None means no trades yet this session (shown as NA)
         self.next_reset_ms = None  # set by the first trade
+        # The session's first trade: its price is the base for the change since 00:00 UTC.
+        # An earlier trade found later (startup fetch, gap, late arrival) replaces it.
+        self.open_price = None
+        self.open_time_ms = None
 
     def add_trade(self, price, quantity, trade_time_ms, is_buy):
         """Add one trade and recalculate VWAP. Returns True if a new session started."""
@@ -119,9 +131,17 @@ class SessionTracker:
             self.buy_volume = 0.0
             self.vwap = None
             self.next_reset_ms = next_midnight_ms(trade_time_ms)
+            self.open_price = self.open_time_ms = None
 
+        self.note_price(price, trade_time_ms)
         self.add_totals(*trade_totals(price, quantity, is_buy))
         return new_session
+
+    def note_price(self, price, trade_time_ms):
+        """Keep the price of the earliest trade in the session as its opening price."""
+        if self.open_time_ms is None or trade_time_ms < self.open_time_ms:
+            self.open_price = price
+            self.open_time_ms = trade_time_ms
 
     def add_totals(self, pv, volume, buy_pv, buy_volume):
         """Add already-summed totals (e.g. from candles) and recalculate VWAP."""
@@ -182,6 +202,60 @@ def order_flow(pv, volume, buy_pv, buy_volume):
         sell = total - buy
         return {"buy": buy, "sell": sell, "delta": buy - sell}
     return {"quote": one_unit(pv, buy_pv), "base": one_unit(volume, buy_volume)}
+
+
+class MinuteCloses:
+    """The last price of each recent minute, by trade time, for volatility.
+
+    A minute's close is the price of its latest trade, so a trade that arrives late or
+    is fetched after a gap only replaces it if it happened later in that minute.
+    """
+
+    def __init__(self):
+        self.closes = {}  # minute (trade time // MINUTE_MS) -> (time_ms, price)
+        self.newest_minute = None
+
+    def add(self, price, trade_time_ms):
+        minute = trade_time_ms // MINUTE_MS
+        kept = self.closes.get(minute)
+        if kept is None or trade_time_ms >= kept[0]:
+            self.closes[minute] = (trade_time_ms, price)
+        if self.newest_minute is None or minute > self.newest_minute:
+            self.newest_minute = minute
+            # One extra minute is kept so the oldest minute in the window can take its close.
+            for old in [m for m in self.closes if m < minute - VOLATILITY_WINDOW_MIN - 1]:
+                del self.closes[old]
+
+    def series(self, last_minute):
+        """Closes of the VOLATILITY_WINDOW_MIN + 1 minutes up to last_minute, oldest first.
+
+        A minute with no trades keeps the previous close (the price didn't move). Minutes
+        before the first close known are left out, so the list is shorter while warming up.
+        """
+        first_minute = last_minute - VOLATILITY_WINDOW_MIN
+        earlier = [m for m in self.closes if m < first_minute]
+        price = self.closes[max(earlier)][1] if earlier else None
+        series = []
+        for minute in range(first_minute, last_minute + 1):
+            if minute in self.closes:
+                price = self.closes[minute][1]
+            if price is not None:
+                series.append(price)
+        return series
+
+
+def realized_volatility(closes):
+    """Annualized volatility in percent from consecutive one-minute closes, or None with fewer than 3.
+
+    The sample standard deviation of the log returns ln(close / previous close), scaled
+    from one minute to a year by the square root of MINUTES_PER_YEAR.
+    """
+    returns = [math.log(now / before) for before, now in zip(closes, closes[1:])]
+    if len(returns) < 2:
+        return None
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+    return math.sqrt(variance * MINUTES_PER_YEAR) * 100
 
 
 class TradeIdChecker:
@@ -331,7 +405,7 @@ def is_buy(trade):
 
 
 def check_candle(candle):
-    """Raise ValueError unless a 1m kline row has the fields the session totals need.
+    """Raise ValueError unless a 1m kline row has the fields the session totals and volatility need.
 
     A row is [open time, open, high, low, close, volume, close time, quote volume,
     trade count, taker buy volume, taker buy quote volume, ...]. Volume can be 0 in a
@@ -343,6 +417,8 @@ def check_candle(candle):
         raise ValueError(f"kline open or close time isn't a possible time: {candle!r:.200}")
     if not all(is_number(candle[i], 0) for i in (5, 7, 9, 10)):
         raise ValueError(f"kline volume, quote volume or taker buy volumes aren't numbers: {candle!r:.200}")
+    if not all(is_number(candle[i], 0) and float(candle[i]) > 0 for i in (1, 4)):
+        raise ValueError(f"kline open or close isn't a positive price: {candle!r:.200}")
 
 
 def check_list(response, path):
@@ -408,10 +484,13 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
     minute (not including it). aggTrades cover that minute up to, but not including,
     the first live trade.
 
-    Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count).
+    Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count, opening).
+    opening is (price, time_ms) of the session's first trade found (a candle's open is
+    its first trade), or None if there were no trades before the first live trade.
     """
     minute_start_ms = first_trade["T"] - first_trade["T"] % MINUTE_MS
     totals = [0.0, 0.0, 0.0, 0.0]  # pv, volume, buy_pv, buy_volume
+    opening = None
 
     candle_count = 0
     if minute_start_ms > session_start_ms:
@@ -429,12 +508,17 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
             for i, column in enumerate((7, 5, 10, 9)):
                 totals[i] += float(candle[column])
             candle_count += 1
+            # A minute with no trades has an open too (the previous close), so skip those.
+            if opening is None and float(candle[5]) > 0:
+                opening = (float(candle[1]), open_time_ms)
 
     trades = await fetch_trades_before(symbol, minute_start_ms, first_trade, log)
-    for price, quantity, _, buy in trades:
+    for price, quantity, time_ms, buy in trades:
         for i, value in enumerate(trade_totals(price, quantity, buy)):
             totals[i] += value
-    return *totals, candle_count, len(trades)
+        if opening is None:
+            opening = (price, time_ms)
+    return *totals, candle_count, len(trades), opening
 
 
 async def backfill(symbol, tracker, first_trade, log):
@@ -446,12 +530,15 @@ async def backfill(symbol, tracker, first_trade, log):
     session_reset_ms = tracker.next_reset_ms
     session_start_ms = session_reset_ms - DAY_MS
     log("info", f"Fetching the session's earlier trades since {format_time(session_start_ms)} UTC")
-    *totals, candle_count, trade_count = await fetch_earlier_trades(symbol, session_start_ms, first_trade, log)
+    *totals, candle_count, trade_count, opening = await fetch_earlier_trades(symbol, session_start_ms,
+                                                                             first_trade, log)
 
     if tracker.next_reset_ms != session_reset_ms:
         log("info", "A new session started before the fetch finished; discarding the fetched trades")
         return
     tracker.add_totals(*totals)
+    if opening is not None:
+        tracker.note_price(*opening)
     log("info", f"Added {candle_count} one-minute candles and {trade_count} trades. Session metrics calculated")
 
 
@@ -472,8 +559,30 @@ async def fill_window(symbol, window, first_trade, log):
     log("info", f"Added {len(trades)} trades. {ROLLING_WINDOW_S} second rolling window metrics calculated")
 
 
-async def fetch_gap(symbol, tracker, window, checker, first_id, last_id, log):
-    """Fetch the trades in one gap from REST and add those still missing to the totals.
+async def fill_closes(symbol, closes, first_trade, log):
+    """Fetch the closes of the VOLATILITY_WINDOW_MIN + 1 minutes before the first live trade's minute.
+
+    That minute's own close comes from live trades, so volatility is full at once.
+    Each candle's close counts as a trade at the candle's last millisecond, so a live
+    trade can't replace it. Adding the same closes twice changes nothing, so starting
+    it again after a failure is safe.
+    """
+    log("info", f"Fetching one-minute candles from the last {VOLATILITY_WINDOW_MIN} minutes")
+    minute_start_ms = first_trade["T"] - first_trade["T"] % MINUTE_MS
+    candles = await get_json("/fapi/v1/klines", {
+        "symbol": symbol, "interval": "1m", "limit": VOLATILITY_WINDOW_MIN + 1,
+        "startTime": minute_start_ms - (VOLATILITY_WINDOW_MIN + 1) * MINUTE_MS, "endTime": minute_start_ms - 1,
+    }, log)
+    check_list(candles, "/fapi/v1/klines")
+    for candle in candles:
+        check_candle(candle)  # every row first, so a bad one adds nothing
+    for candle in candles:
+        closes.add(float(candle[4]), candle[6])
+    log("info", f"Added {len(candles)} one-minute candles. Volatility calculated")
+
+
+async def fetch_gap(symbol, tracker, window, closes, checker, first_id, last_id, log):
+    """Fetch the trades in one gap from REST and add those still missing to every metric.
 
     A fetched trade is only counted if its ID is still in the missing set, so a trade
     that also arrives late on the stream is never counted twice. Trades from before
@@ -496,7 +605,9 @@ async def fetch_gap(symbol, tracker, window, checker, first_id, last_id, log):
                 continue  # already arrived late on the stream
             price, quantity = float(trade["p"]), float(trade["q"])
             window.add(price, quantity, trade["T"], is_buy(trade))
+            closes.add(price, trade["T"])
             if tracker.in_session(trade["T"]):
+                tracker.note_price(price, trade["T"])
                 tracker.add_totals(*trade_totals(price, quantity, is_buy(trade)))
                 added += 1
             else:
@@ -551,7 +662,8 @@ class EventLog:
 
 
 class AssetTracker:
-    """Everything one asset keeps for itself: session totals, rolling window, ID checks, fetches, last trade, events.
+    """Everything one asset keeps for itself: session totals, rolling window, minute closes, ID checks,
+    fetches, last trade, events.
 
     Every asset uses the same formulas (SessionTracker, TradeIdChecker, the fetch
     functions) but has its own numbers, so a gap in one asset never touches another.
@@ -564,6 +676,7 @@ class AssetTracker:
         self.event_log = EventLog(symbol, on_event)
         self.tracker = SessionTracker()
         self.window = RollingWindow()
+        self.closes = MinuteCloses()
         self.checker = TradeIdChecker()
         self.backfill_task = None
         self.fetch_tasks = set()  # keeps running fetch tasks referenced until they finish
@@ -611,6 +724,17 @@ class AssetTracker:
             "flow": order_flow(pv, volume, buy_pv, buy_volume),
         }
 
+    def volatility_snapshot(self):
+        """Volatility over the finished minutes, or None before the first trade.
+
+        "minutes" is how many one-minute returns it uses: VOLATILITY_WINDOW_MIN once the
+        startup fetch has filled it, fewer while it fills with live trades instead.
+        """
+        if self.last_trade is None:
+            return None
+        series = self.closes.series(self.binance_now_ms() // MINUTE_MS - 1)
+        return {"annualized_pct": realized_volatility(series), "minutes": max(0, len(series) - 1)}
+
     def snapshot(self):
         """This asset's state as plain copied values (no await, so always consistent)."""
         session_start_ms = None
@@ -621,6 +745,9 @@ class AssetTracker:
         if vwap is not None and self.last_trade is not None:
             distance_pct = (self.last_trade["price"] - vwap) / vwap * 100
         tracker = self.tracker
+        change_pct = None
+        if tracker.open_price is not None and self.last_trade is not None:
+            change_pct = (self.last_trade["price"] - tracker.open_price) / tracker.open_price * 100
         return {
             "symbol": self.symbol,
             "base_asset": self.symbol.removesuffix(QUOTE_ASSET),  # the coin: BTC, ETH, XAU
@@ -630,11 +757,14 @@ class AssetTracker:
             "missing_count": len(self.checker.missing_ids),
             "session_start_ms": session_start_ms,
             "last_trade": dict(self.last_trade) if self.last_trade else None,
+            "session_open": tracker.open_price,
+            "session_change_pct": change_pct,  # how far the last price is from the session's first trade
             "vwap": vwap,
             "vwap_distance_pct": distance_pct,  # how far the last price is above (+) or below (-) VWAP
             # delta here is CVD
             "flow": order_flow(tracker.cumulative_pv, tracker.cumulative_volume, tracker.buy_pv, tracker.buy_volume),
             "rolling": self.rolling_snapshot(),
+            "volatility": self.volatility_snapshot(),
         }
 
     def start_task(self, name, function, *args):
@@ -656,12 +786,15 @@ class AssetTracker:
             return
         if kind == "late":
             self.window.add(price, quantity, trade_time_ms, buy)
+            self.closes.add(price, trade_time_ms)
             if self.tracker.in_session(trade_time_ms):
+                self.tracker.note_price(price, trade_time_ms)
                 self.tracker.add_totals(*trade_totals(price, quantity, buy))
                 self.log("info", f"Late trade {trade['a']} arrived and was added")
             return
 
         self.window.add(price, quantity, trade_time_ms, buy)
+        self.closes.add(price, trade_time_ms)
         if self.tracker.add_trade(price, quantity, trade_time_ms, buy):
             session_date = datetime.fromtimestamp(trade_time_ms / 1000, tz=timezone.utc).date()
             self.log("info", f"New session: {session_date} (UTC)")
@@ -674,11 +807,14 @@ class AssetTracker:
                                                  self.symbol, self.tracker, trade, self.log)
             self.start_task(f"Fetching the last {ROLLING_WINDOW_S} seconds", fill_window,
                             self.symbol, self.window, trade, self.log)
+            self.start_task(f"Fetching the last {VOLATILITY_WINDOW_MIN} minutes", fill_closes,
+                            self.symbol, self.closes, trade, self.log)
         if gap is not None:
             first_id, last_id = gap
             self.log("info", f"Gap: {last_id - first_id + 1} trades missing (IDs {first_id}-{last_id}); fetching from REST")
             self.start_task(f"Fetching gap {first_id}-{last_id}", fetch_gap,
-                            self.symbol, self.tracker, self.window, self.checker, first_id, last_id, self.log)
+                            self.symbol, self.tracker, self.window, self.closes, self.checker,
+                            first_id, last_id, self.log)
 
         if self.on_trade:
             self.on_trade(self.symbol)

@@ -60,6 +60,7 @@
     col.w-pct { width: calc(8ch + 24px); }      /* +10.00% */
     col.w-volume { width: calc(14ch + 24px); }  /* -308.84M USDT, +1,234,567 ETH */
     col.w-rate { width: calc(9ch + 24px); }     /* Trades/s */
+    col.w-vol { width: calc(10ch + 24px); }     /* Volatility, 1234.5% */
     td.placeholder { white-space: normal; }     /* "Waiting for first trade" wraps instead of widening the column */
 
     th.group { text-align: center; color: var(--text); }
@@ -114,19 +115,23 @@
       <!-- Fixed widths, so a number getting longer never moves the columns. -->
       <colgroup>
         <col class="w-symbol"><col class="w-price"><col class="w-age">
+        <col class="w-pct">
         <col class="w-price"><col class="w-pct"><col class="w-volume"><col class="w-volume"><col class="w-volume">
         <col class="w-price"><col class="w-volume"><col class="w-volume"><col class="w-volume">
         <col class="w-rate"><col class="w-volume">
+        <col class="w-vol">
       </colgroup>
       <thead>
         <tr>
           <th rowspan="2">Symbol</th><th rowspan="2">Price</th><th rowspan="2">Last trade</th>
-          <th colspan="5" class="group start">Session (since 00:00 UTC)</th>
+          <th colspan="6" class="group start">Session (since 00:00 UTC)</th>
           <th colspan="6" class="group start">Last 60 s</th>
+          <th class="group start">Last 60 min</th>
         </tr>
         <tr>
-          <th class="start">VWAP</th><th>vs VWAP</th><th>Buy vol</th><th>Sell vol</th><th>Delta (CVD)</th>
+          <th class="start">Change</th><th>VWAP</th><th>vs VWAP</th><th>Buy vol</th><th>Sell vol</th><th>Delta (CVD)</th>
           <th class="start">VWAP</th><th>Buy vol</th><th>Sell vol</th><th>Delta</th><th>Trades/s</th><th>Vol/min</th>
+          <th class="start">Volatility</th>
         </tr>
       </thead>
       <tbody id="assets"></tbody> <!-- one row per asset, added by app.js -->
@@ -136,7 +141,10 @@
     Volumes are shown in USDT (price &times; quantity) and in the coin itself (BTC, ETH, XAU = troy ounces of gold);
     the switch above picks which is large. A buy is a trade where the buyer took a seller's resting order, a sell
     the other way round; delta is buy volume minus sell volume (over the session: CVD).
-    Trades/s counts Binance's aggregated trades (one per taker order and price).<br>
+    Trades/s counts Binance's aggregated trades (one per taker order and price).
+    Change: the price now against the session's first trade after 00:00 UTC.
+    Volatility: how much the price swings, as the standard deviation of the last 60 one-minute returns
+    scaled to a year (&times; &radic;525,600 minutes, as these markets trade every day); it updates once a minute.<br>
     <span class="swatch">Yellow numbers</span>: some trades are still being fetched after a gap; usable but not final.
     Grey numbers: not live (reconnecting, or the app is unreachable).
   </p>

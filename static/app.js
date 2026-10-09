@@ -108,14 +108,17 @@ function rowFor(symbol) {
     cells = {
       row, symbol: cell(), price: cell(), age: cell(),
       // session (since 00:00 UTC)
-      vwap: cell(), distance: cell(), buy: cell(), sell: cell(), delta: cell(),
+      change: cell(), vwap: cell(), distance: cell(), buy: cell(), sell: cell(), delta: cell(),
       // rolling window (last 60 s)
       rollingVwap: cell(), rollingBuy: cell(), rollingSell: cell(), rollingDelta: cell(),
       tradeRate: cell(), volumeRate: cell(),
+      // last 60 min
+      volatility: cell(),
     };
     cells.symbol.textContent = symbol;
-    cells.vwap.classList.add("start");
+    cells.change.classList.add("start");
     cells.rollingVwap.classList.add("start");
+    cells.volatility.classList.add("start");
     assetRows.append(row);
     rows.set(symbol, cells);
   }
@@ -188,9 +191,13 @@ function renderAsset(asset, live) {
   const gap = !asset.complete; // yellow while a gap is being filled
   const placeholder = { waiting: "Waiting for first trade", fetching: "Fetching data" }[asset.history];
   if (placeholder || asset.vwap === null) {
-    setCell(cells.vwap, placeholder || "-", { placeholder: true });
-    for (const cell of [cells.distance, cells.buy, cells.sell, cells.delta]) setCell(cell, "-", { placeholder: true });
+    setCell(cells.change, placeholder || "-", { placeholder: true });
+    for (const cell of [cells.vwap, cells.distance, cells.buy, cells.sell, cells.delta]) {
+      setCell(cell, "-", { placeholder: true });
+    }
   } else {
+    const change = asset.session_change_pct;
+    setCell(cells.change, signed(change.toFixed(2) + "%", change), { sign: change, gap });
     const distance = asset.vwap_distance_pct;
     setCell(cells.vwap, asset.vwap.toFixed(2), { gap });
     setCell(cells.distance, signed(distance.toFixed(2) + "%", distance), { sign: distance, gap });
@@ -218,6 +225,15 @@ function renderAsset(asset, live) {
                   { isDelta: true, gap });
     setCell(cells.tradeRate, rolling.trades_per_s.toFixed(1), { gap });
     setVolumeCell(cells.volumeRate, rolling.volume_per_min, asset, { gap });
+  }
+
+  // Last 60 min: not shown until it has all 60 one-minute returns (the startup fetch
+  // brings them within seconds; without it they come from live trades, one a minute).
+  const volatility = asset.volatility;
+  if (!volatility || volatility.minutes < 60) {
+    setCell(cells.volatility, volatility ? `Warming up (${volatility.minutes}/60 min)` : "-", { placeholder: true });
+  } else {
+    setCell(cells.volatility, volatility.annualized_pct.toFixed(1) + "%", { gap });
   }
 }
 

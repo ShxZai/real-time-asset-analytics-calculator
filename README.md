@@ -13,12 +13,22 @@ Metrics, per asset:
 
 | | Session (since 00:00 UTC) | Last 60 seconds (rolling) |
 |---|---|---|
+| **Change** (last price vs the session's first trade, in %) | yes | |
 | **VWAP** (volume-weighted average price) | yes | yes |
 | **Distance from VWAP** (last price vs VWAP, in %) | yes | |
 | **Buy and sell volume** | yes | yes |
 | **Delta** (buy minus sell volume; over the session this is **CVD**) | yes | yes |
 | **Trade rate** (aggregated trades per second) | | yes |
 | **Volume rate** (volume per minute) | | yes |
+
+Plus **realized volatility** over the last 60 minutes: the sample standard deviation of
+one-minute log returns (each minute's last price; a quiet minute keeps the previous
+one), annualized with √525,600 (minutes in a 365-day year, as these markets trade
+every day) and shown in %. The finished minutes only, so it updates once a minute.
+At startup the hour before comes from 1m candles, so it's ready at once.
+Change uses the same per-asset base (the session's first trade), so a $80,000 asset and
+a $2,000 one can be compared side by side; the session's open matches Binance's
+official daily open.
 
 A trade is a buy when the buyer was the taker (bought at the ask) and a sell when the
 seller was, as given by Binance's `m` flag. Every volume is shown in USDT (price ×
@@ -92,6 +102,5 @@ country first. The live app (`server.py` and `metrics.py`) needs this too.
 
 ## Roadmap
 
-- More metrics (VWAP bands, realized volatility, large-trade alerts, order-book imbalance)
-- An equal-weighted index across the assets
-- Comparing assets on the page
+- More metrics (VWAP bands, large-trade alerts, order-book imbalance)
+- Click a row to expand a price chart

@@ -318,6 +318,7 @@ def test_snapshot_before_the_first_trade_is_empty_and_waiting():
         assert asset["history"] == "waiting"
         assert asset["vwap"] is None and asset["last_trade"] is None and asset["session_start_ms"] is None
         assert asset["vwap_distance_pct"] is None and asset["rolling"] is None
+        assert asset["session_change_pct"] is None and asset["volatility"] is None
         assert asset["flow"]["quote"] == {"buy": 0, "sell": 0, "delta": 0}
     assert [(a["base_asset"], a["quote_asset"]) for a in snapshot["assets"]] == [
         ("BTC", "USDT"), ("ETH", "USDT"), ("XAU", "USDT")]
@@ -364,8 +365,15 @@ def test_startup_fetches_sum_the_session_from_candles_and_fill_the_window_with_t
 
     monkeypatch.setattr(metrics, "get_json", get_json)
     result = asyncio.run(metrics.fetch_earlier_trades("XAUUSDT", MIDNIGHT_MS, first_live, lambda *_: None))
-    # pv, volume, buy pv (200 + 300), buy volume (2 + 3), candles, trades; trade 9 isn't counted twice
-    assert result == (1000, 10, 500, 5, 2, 2)
+    # pv, volume, buy pv (200 + 300), buy volume (2 + 3), candles, trades, opening (the first candle's
+    # open, as it had trades); trade 9 isn't counted twice
+    assert result == (1000, 10, 500, 5, 2, 2, (1, MIDNIGHT_MS))
+
+    # backfill adds them, and the first candle's open replaces the first live trade as the session's open.
+    tracker = metrics.SessionTracker()
+    tracker.add_trade(100, 1, first_live["T"], True)
+    asyncio.run(metrics.backfill("XAUUSDT", tracker, first_live, lambda *_: None))
+    assert (tracker.open_price, tracker.open_time_ms) == (1, MIDNIGHT_MS)
 
     # The window gets the trades of the last minute before the first live trade, whichever candle they're in.
     window = metrics.RollingWindow()
@@ -374,6 +382,70 @@ def test_startup_fetches_sum_the_session_from_candles_and_fill_the_window_with_t
     assert window.totals(first_live["T"]) == [1000, 10, 800, 8, 3]
     assert window.complete_from_ms == metrics.window_fetch_start_ms(first_live["T"])
     assert logged[-1] == ("info", "Added 3 trades. 60 second rolling window metrics calculated")
+
+
+def test_session_open_is_the_earliest_trade_found_and_resets_each_session():
+    tracker = metrics.SessionTracker()
+    tracker.add_trade(101, 1, MIDNIGHT_MS + 5_000, True)  # first live trade
+    assert tracker.open_price == 101
+    tracker.note_price(100, MIDNIGHT_MS + 3_000)  # earlier, e.g. from the startup fetch: replaces it
+    tracker.note_price(99, MIDNIGHT_MS + 4_000)  # later than the open: doesn't
+    tracker.add_trade(98, 1, MIDNIGHT_MS + 6_000, True)
+    assert (tracker.open_price, tracker.open_time_ms) == (100, MIDNIGHT_MS + 3_000)
+    tracker.add_trade(120, 1, MIDNIGHT_MS + metrics.DAY_MS + 1, True)  # next session
+    assert (tracker.open_price, tracker.open_time_ms) == (120, MIDNIGHT_MS + metrics.DAY_MS + 1)
+
+
+def test_realized_volatility_is_the_annualized_sample_deviation_of_log_returns():
+    assert metrics.realized_volatility([100, 101]) is None  # one return has no deviation
+    assert metrics.realized_volatility([100, 100, 100]) == 0
+    # Returns +a and -a: mean 0, sample variance (a² + a²) / (2 - 1).
+    a = math.log(101 / 100)
+    expected = math.sqrt(2 * a * a * 365 * 24 * 60) * 100
+    assert math.isclose(metrics.realized_volatility([100, 101, 100]), expected)
+
+
+def test_minute_closes_keep_each_minutes_latest_trade_and_carry_quiet_minutes():
+    closes = metrics.MinuteCloses()
+    m = MIDNIGHT_MS // metrics.MINUTE_MS
+    closes.add(100, MIDNIGHT_MS + 10_000)
+    closes.add(101, MIDNIGHT_MS + 50_000)
+    closes.add(99, MIDNIGHT_MS + 20_000)  # arrives late but happened earlier: not the close
+    closes.add(102, MIDNIGHT_MS + 2 * metrics.MINUTE_MS)  # minute m + 1 had no trades
+    # Before minute m nothing is known, so the series is shorter (still warming up).
+    assert closes.series(m + 2) == [101, 101, 102]
+    assert closes.series(m + 3) == [101, 101, 102, 102]  # a quiet last minute keeps the close
+    # An hour on, minutes older than the window and the one before it are dropped; the
+    # window's quiet minutes all take minute m + 2's close.
+    closes.add(110, MIDNIGHT_MS + 63 * metrics.MINUTE_MS)
+    assert min(closes.closes) == m + 2
+    assert closes.series(m + 62) == [102] * 61
+
+
+def test_startup_candle_fetch_fills_an_hour_of_volatility_at_once(monkeypatch):
+    first_live = make_trade(1, 100, MIDNIGHT_MS + 120 * metrics.MINUTE_MS + 500)
+    minute_start = first_live["T"] - 500
+    asked = []
+
+    async def get_json(path, params, log):
+        asked.append(params)
+        # 61 candles ending just before the first live trade's minute, closes alternating 100 / 101.
+        return [[t, "100", "1", "1", "100" if i % 2 == 0 else "101", "1", t + metrics.MINUTE_MS - 1,
+                 "100", 1, "1", "100", "0"]
+                for i, t in enumerate(range(params["startTime"], params["endTime"], metrics.MINUTE_MS))]
+
+    monkeypatch.setattr(metrics, "get_json", get_json)
+    asset = metrics.AssetTracker("XAUUSDT")
+    asyncio.run(metrics.fill_closes("XAUUSDT", asset.closes, first_live, lambda *_: None))
+    assert asked[0]["endTime"] == minute_start - 1 and asked[0]["limit"] == 61
+    assert len(asset.closes.closes) == 61
+
+    # During the first live trade's minute, the finished minutes are all fetched ones.
+    asset.last_trade = {"price": 100, "quantity": 1, "time_ms": first_live["T"], "received_ms": metrics.now_ms()}
+    volatility = asset.volatility_snapshot()
+    assert volatility["minutes"] == 60
+    assert math.isclose(volatility["annualized_pct"],
+                        metrics.realized_volatility([100 if i % 2 == 0 else 101 for i in range(61)]))
 
 
 def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
@@ -397,6 +469,10 @@ def test_snapshot_after_a_gap_shows_the_filled_state_and_is_a_copy(monkeypatch):
     session_vwap = (100 * 1 + 101 * 2 + 102 * 3 + 103 * 4) / 10
     assert math.isclose(asset["vwap"], session_vwap)
     assert math.isclose(asset["vwap_distance_pct"], (103 - session_vwap) / session_vwap * 100)
+    # The session's first trade is trade 0 at 100, so the price is up 3%.
+    assert asset["session_open"] == 100 and math.isclose(asset["session_change_pct"], 3)
+    # Only one minute (trade 0's) has finished, so there are no returns yet.
+    assert asset["volatility"] == {"annualized_pct": None, "minutes": 0}
     # Buys are trades 0 and 2: 100 x 1 + 102 x 3 = 406 USDT, 1 + 3 = 4 coins.
     assert asset["flow"]["quote"] == {"buy": 406, "sell": 1020 - 406, "delta": 406 - 614}
     assert asset["flow"]["base"] == {"buy": 4, "sell": 6, "delta": -2}
