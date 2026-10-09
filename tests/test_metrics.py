@@ -1,4 +1,4 @@
-"""Tests for metrics.py. Run with: python -m pytest
+"""Tests for metrics.py. Run with: python -m pytest  (offline only: -m "not live")
 
 Offline tests use test doubles: a fake WebSocket server on this machine stands in
 for Binance's stream, and a fake get_json returns trades we wrote ourselves instead
@@ -527,6 +527,9 @@ def test_get_json_waits_as_long_as_binance_asks_when_rate_limited(monkeypatch):
 
 
 # ---------- live tests (real Binance) ----------
+# Run these on your own machine: python -m pytest -m live
+# Binance blocks US connections, so from the US connect through a VPN first.
+# CI skips them for the same reason (GitHub's runners are in the US).
 
 LIVE_SYMBOL = "XAUUSDT"
 LIVE_URL = metrics.combined_stream_url([LIVE_SYMBOL])
@@ -567,6 +570,7 @@ async def receive_until_boundary(asset, ws, ready):
         asset.handle_trade(trade)
 
 
+@pytest.mark.live
 def test_live_startup_fetch_matches_official_candles():
     async def scenario():
         live = metrics.AssetTracker(LIVE_SYMBOL)
@@ -580,6 +584,7 @@ def test_live_startup_fetch_matches_official_candles():
     assert_matches_official(live.tracker, boundary_ms)
 
 
+@pytest.mark.live
 def test_live_forced_reconnect_fills_gap_and_matches_official_candles():
     async def scenario():
         live = metrics.AssetTracker(LIVE_SYMBOL)

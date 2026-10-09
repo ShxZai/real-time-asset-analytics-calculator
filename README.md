@@ -72,12 +72,23 @@ python backtest.py [YYYY-MM-DD]
 ## Tests
 
 ```
-python -m pytest
+python -m pytest                 # everything
+python -m pytest -m "not live"   # offline only, a few seconds
 ```
 
-Most tests run offline against fake local servers. Two live tests compare results
-with Binance's official 1 minute candles; they need an internet connection and
-take about 2 minutes.
+The tests live in `tests/`. Most run offline against fake local servers. Two live
+tests compare results with Binance's official 1 minute candles; they need an
+internet connection and take about 2 minutes.
+
+Every push and pull request runs the offline tests on GitHub Actions
+(`.github/workflows/tests.yml`). The live tests are left out there because Binance
+refuses connections from GitHub's US-based servers.
+
+### Running the live tests
+
+Run the live tests on your own machine with `python -m pytest -m live`. Binance blocks
+connections from the US, so if you're in the US, connect through a VPN in another
+country first. The live app (`server.py` and `metrics.py`) needs this too.
 
 ## Roadmap
 
