@@ -6,11 +6,23 @@ A live dashboard that streams every trade from Binance and turns it into trading
 as it happens: VWAP, buy and sell volume, delta, trade rate, volatility and more, for
 several assets at once.
 
-It tracks **BTCUSDT**, **ETHUSDT** and **XAUUSDT** (gold) on Binance USDⓈ-M futures.
+It tracks twelve assets on Binance USDⓈ-M futures, in four groups:
+
+| Group | Assets |
+|---|---|
+| Crypto | **BTCUSDT**, **ETHUSDT**, **SOLUSDT**, **BNBUSDT** |
+| Commodities | **XAUUSDT** (gold), **XAGUSDT** (silver), **CLUSDT** (WTI crude oil) |
+| US stock indexes | **SPYUSDT** (S&P 500), **QQQUSDT** (Nasdaq-100) |
+| US stocks | **NVDAUSDT** (Nvidia), **TSLAUSDT** (Tesla), **MSTRUSDT** (Strategy, which holds bitcoin) |
+
+The commodity and stock contracts are Binance's own perpetual futures that track those
+prices. They trade around the clock like crypto, just more thinly when the real market
+is closed.
+
 The page shows one row per asset, updated several times a second. Click a row to open
 that asset's price chart underneath: one-minute candles since 00:00 UTC with the session
 VWAP drawn as a line, next to the session's open, high, low, range, total volume and buy
-share. A switch picks whether volumes are shown in USDT or in the coin itself.
+share. A switch picks whether volumes are shown in USDT or in units of the asset itself.
 At 00:00 UTC the chart and every session metric start over; earlier days aren't kept.
 
 ```
@@ -40,7 +52,8 @@ markets trade every day) and shown in %. It updates once a minute.
 
 A trade is a buy when the buyer was the taker (bought at the ask) and a sell when the
 seller was, as given by Binance's `m` flag. Volumes are in USDT (price × quantity) or in
-the coin (BTC, ETH, XAU = troy ounces). Change uses each asset's own session base, so an
+units of the asset: coins for crypto, troy ounces for gold and silver, barrels for oil,
+shares for stocks and index ETFs. Change uses each asset's own session base, so an
 $80,000 asset and a $2,000 one can be compared side by side.
 
 If the app starts mid-session, it fetches the session's earlier trades and Binance's
@@ -100,11 +113,20 @@ gives:
 |---|---:|---:|---:|---:|
 | BTCUSDT | 1,280,357 | 5.2e-12 | 1,440 / 1,440 | 90 |
 | ETHUSDT | 1,300,812 | 2.0e-12 | 1,440 / 1,440 | 89 |
+| SOLUSDT | 286,696 | 3.1e-13 | 1,440 / 1,440 | 43 |
+| BNBUSDT | 212,120 | 6.9e-13 | 1,440 / 1,440 | 12 |
 | XAUUSDT | 623,364 | 6.5e-13 | 1,440 / 1,440 | 30 |
+| XAGUSDT | 102,444 | 4.7e-14 | 1,440 / 1,440 | 3 |
+| CLUSDT | 90,566 | 1.3e-14 | 1,440 / 1,440 | 3 |
+| SPYUSDT | 27,179 | 6.9e-14 | 1,440 / 1,440 | 1 |
+| QQQUSDT | 88,854 | 1.5e-13 | 1,440 / 1,440 | 1 |
+| NVDAUSDT | 100,946 | 4.8e-14 | 1,440 / 1,440 | 7 |
+| TSLAUSDT | 88,943 | 2.0e-14 | 1,440 / 1,440 | 2 |
+| MSTRUSDT | 162,473 | 3.3e-13 | 1,440 / 1,440 | 1 |
 
-A candle matches when its open, high, low and close are equal and its volume (in coins
-and in USDT) agrees to 1e-9. 2026-10-13 gives the same result (every minute matches;
-101, 83 and 24 split trades).
+A candle matches when its open, high, low and close are equal and its volume (in units
+and in USDT) agrees to 1e-9. For BTC, ETH and gold, 2026-10-13 gives the same result
+(every minute matches; 101, 83 and 24 split trades).
 
 **Trades split across a minute boundary.** The first version of the per-minute check
 failed on about 12% of BTC and ETH minutes, always in pairs: one minute had a little too
@@ -188,7 +210,7 @@ python backtest.py [YYYY-MM-DD] [--symbol BTCUSDT]
 Replays a full day of every asset's trades from Binance's historical trade files through
 the same code the live app runs, and checks the day's VWAP, volume and buy volume
 against Binance's official daily candle, and every one-minute candle against its
-official one. It defaults to yesterday (UTC); the files, about 40 MB for the three
+official one. It defaults to yesterday (UTC); the files, about 60 MB for all twelve
 assets, are kept in `data/`. On a day that starts with part of the previous day's last
 trade, it also downloads the previous day's file to read that trade. It exits with code
 1 if any check fails.

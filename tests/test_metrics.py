@@ -369,7 +369,8 @@ def test_snapshot_before_the_first_trade_is_empty_and_waiting():
         assert asset["session_change_pct"] is None and asset["volatility"] is None
         assert asset["flow"]["quote"] == {"buy": 0, "sell": 0, "delta": 0}
     assert [(a["base_asset"], a["quote_asset"]) for a in snapshot["assets"]] == [
-        ("BTC", "USDT"), ("ETH", "USDT"), ("XAU", "USDT")]
+        (symbol.removesuffix("USDT"), "USDT") for symbol in metrics.SYMBOLS]
+    assert snapshot["assets"][4]["base_asset"] == "XAU" and snapshot["assets"][6]["base_asset"] == "CL"
 
 
 def test_rolling_window_counts_the_last_60_seconds_by_trade_time():

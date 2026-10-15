@@ -1,4 +1,4 @@
-"""Live VWAP and order flow for several Binance USD-M futures (BTCUSDT, ETHUSDT, XAUUSDT).
+"""Live VWAP and order flow for several Binance USD-M futures (crypto, commodities, stocks).
 
 The engine (LiveFeed) keeps its state and lists of events instead of printing, so a
 display can follow it. Running this file shows it in the terminal.
@@ -56,14 +56,19 @@ REST_URL = "https://fapi.binance.com"
 # Binance's combined stream: one connection carries every symbol's trades, each
 # message wrapped as {"stream": "btcusdt@aggTrade", "data": {...trade, "s": "BTCUSDT"}}.
 STREAM_BASE_URL = "wss://fstream.binance.com/market/stream?streams="
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"]  # adding an asset = adding its symbol here
+SYMBOLS = [  # adding an asset = adding its symbol here; the page lists them in this order
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",  # crypto
+    "XAUUSDT", "XAGUSDT", "CLUSDT",  # commodities: gold, silver, WTI crude oil
+    "SPYUSDT", "QQQUSDT",  # US stock indexes: S&P 500, Nasdaq-100 (ETFs)
+    "NVDAUSDT", "TSLAUSDT", "MSTRUSDT",  # US stocks (MSTR holds bitcoin, a stock that moves with BTC)
+]
 QUOTE_ASSET = "USDT"  # every symbol is priced in this; the rest of the name is the coin (base asset)
 
 MINUTE_MS = 60 * 1000
 DAY_MS = 24 * 60 * MINUTE_MS
 ROLLING_WINDOW_S = 60  # every rolling metric covers this many seconds
 VOLATILITY_WINDOW_MIN = 60  # volatility uses this many one-minute returns
-MINUTES_PER_YEAR = 365 * 24 * 60  # for annualizing; crypto (and Binance's gold) trades every day
+MINUTES_PER_YEAR = 365 * 24 * 60  # for annualizing; crypto (and Binance's commodity and stock contracts) trades every day
 MAX_RETRY_WAIT_S = 60
 # Trade times past this are treated as corrupt (datetime can't handle times that far off).
 MAX_TRADE_TIME_MS = int(datetime(3000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)

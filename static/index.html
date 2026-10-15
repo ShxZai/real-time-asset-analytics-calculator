@@ -142,7 +142,7 @@
     <span>Volume shown large:</span>
     <span id="unit-switch" class="switch" role="group" aria-label="Volume shown large">
       <button type="button" data-unit="quote" aria-pressed="true">USDT</button>
-      <button type="button" data-unit="base" aria-pressed="false">Coin</button>
+      <button type="button" data-unit="base" aria-pressed="false">Units</button>
     </span>
     <button type="button" id="cut-button" class="sim-button" disabled
             title="Cuts the app's connection to Binance (stream and REST) as a Wi-Fi cut would; press again to bring it back">Simulate Wi-Fi cut</button>
@@ -182,7 +182,7 @@
     <ol id="console"></ol>
   </details>
   <p class="legend">
-    Click a row for its chart and details. Volumes show USDT and the coin; the switch picks which is large.
+    Click a row for its chart and details. Volumes show USDT and units (coins, ounces, barrels, shares); the switch picks which is large.
     <span class="swatch">Yellow</span>: trades still being fetched after a gap, not final.
     Grey: not live (reconnecting, or the app is unreachable).
     Checked vs Binance: each finished minute's candle is compared with Binance's official one; mismatches go to the debug console.
