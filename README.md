@@ -11,6 +11,7 @@ The page shows one row per asset, updated several times a second. Click a row to
 that asset's price chart underneath: one-minute candles since 00:00 UTC with the session
 VWAP drawn as a line, next to the session's open, high, low, range, total volume and buy
 share. A switch picks whether volumes are shown in USDT or in the coin itself.
+At 00:00 UTC the chart and every session metric start over; earlier days aren't kept.
 
 ```
 pip install -r requirements.txt
