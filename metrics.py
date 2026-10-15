@@ -146,6 +146,11 @@ class SessionCandles:
         """One minute's candle from this session or the previous one, or None (no trades seen in it)."""
         return self.minutes.get(minute) or self.previous.get(minute)
 
+    def straddle_free(self, minute):
+        """True if no trade can be split across this minute's start: none came in the AGG_WINDOW_MS before it."""
+        before = self.get(minute - 1)
+        return before is None or before[4] < minute * MINUTE_MS - AGG_WINDOW_MS
+
     def add(self, price, quantity, trade_time_ms):
         self.merge(trade_time_ms // MINUTE_MS, trade_time_ms, price, price, price,
                    trade_time_ms, price, price * quantity, quantity, quantity)
@@ -594,35 +599,60 @@ async def fetch_trades_before(symbol, start_ms, first_trade, log):
         params = {"symbol": symbol, "fromId": trades[-1]["a"] + 1, "limit": 1000}
 
 
+async def fetch_trades_from_join(symbol, session_start_ms, first_trade, log):
+    """Pick where the session fetch switches from 1m candles to trades, and fetch the trades from there.
+
+    Returns (join_ms, trades): a minute start no trade can straddle, and the trades from
+    it up to, but not including, the first live trade (as fetch_trades_before gives them).
+    A trade's fills can run AGG_WINDOW_MS past its time and a candle counts each fill in
+    the minute it happened, so at a minute start with a trade in the AGG_WINDOW_MS before
+    it, the part of that trade after it would be in neither. The join is the latest
+    minute start at or before the first live trade's minute without one, or the session
+    start (trades only). Each try fetches from further back (1, 2, 4, ... minutes).
+    """
+    first_minute = first_trade["T"] // MINUTE_MS
+    lookback_min = 0
+    while True:
+        start_ms = max(session_start_ms, (first_minute - lookback_min) * MINUTE_MS - AGG_WINDOW_MS)
+        trades = await fetch_trades_before(symbol, start_ms, first_trade, log)
+        unsafe = {time_ms // MINUTE_MS + 1 for _, _, time_ms, _ in trades  # minute starts a trade may straddle
+                  if time_ms % MINUTE_MS >= MINUTE_MS - AGG_WINDOW_MS}
+        for minute in range(first_minute, first_minute - lookback_min - 1, -1):
+            join_ms = max(minute * MINUTE_MS, session_start_ms)
+            if join_ms == session_start_ms or minute not in unsafe:
+                return join_ms, [trade for trade in trades if trade[2] >= join_ms]
+        lookback_min = max(1, lookback_min * 2)
+
+
 async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
     """Sum one asset's trades in the session from before its first live trade.
 
-    1m candles cover the session start up to the start of the first live trade's
-    minute (not including it). aggTrades cover that minute up to, but not including,
-    the first live trade.
+    1m candles cover the session start up to a minute start no trade straddles, normally
+    the first live trade's minute (see fetch_trades_from_join). aggTrades cover the rest,
+    up to, but not including, the first live trade.
 
     Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count, opening, chart_parts).
     opening is (price, time_ms) of the session's first trade found (a candle's open is
     its first trade), or None if there were no trades before the first live trade.
     chart_parts are the arguments of SessionCandles.merge for each fetched candle and trade.
     """
-    minute_start_ms = first_trade["T"] - first_trade["T"] % MINUTE_MS
+    join_ms, trades = await fetch_trades_from_join(symbol, session_start_ms, first_trade, log)
     totals = [0.0, 0.0, 0.0, 0.0]  # pv, volume, buy_pv, buy_volume
     opening = None
     chart_parts = []
 
     candle_count = 0
-    if minute_start_ms > session_start_ms:
+    if join_ms > session_start_ms:
         candles = await get_json("/fapi/v1/klines", {
             "symbol": symbol, "interval": "1m", "limit": 1500,
-            "startTime": session_start_ms, "endTime": minute_start_ms - 1,
+            "startTime": session_start_ms, "endTime": join_ms - 1,
         }, log)
         check_list(candles, "/fapi/v1/klines")
         for candle in candles:
             check_candle(candle)
             open_time_ms, close_time_ms = candle[0], candle[6]
-            if open_time_ms < session_start_ms or close_time_ms >= minute_start_ms:
-                continue  # outside the session, or the still-open candle
+            if open_time_ms < session_start_ms or close_time_ms >= join_ms:
+                continue  # outside the session, or a minute the trades cover
             # quote volume (= sum of price x quantity), volume, taker buy quote volume, taker buy volume
             for i, column in enumerate((7, 5, 10, 9)):
                 totals[i] += float(candle[column])
@@ -635,7 +665,6 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
                 chart_parts.append((open_time_ms // MINUTE_MS, open_time_ms, open_price, high, low,
                                     close_time_ms, close, float(candle[7]), float(candle[5])))
 
-    trades = await fetch_trades_before(symbol, minute_start_ms, first_trade, log)
     for price, quantity, time_ms, buy in trades:
         for i, value in enumerate(trade_totals(price, quantity, buy)):
             totals[i] += value
@@ -834,8 +863,7 @@ class CandleChecker:
     def find_start(self, asset, last):
         """The first minute up to last whose start no trade can straddle, or None if none has come yet."""
         for minute in range(self.first_minute + 1, last + 1):
-            before = asset.tracker.candles.get(minute - 1)
-            if before is None or before[4] < minute * MINUTE_MS - AGG_WINDOW_MS:
+            if asset.tracker.candles.straddle_free(minute):
                 return minute
         return None
 

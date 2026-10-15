@@ -393,6 +393,38 @@ def test_startup_fetches_sum_the_session_from_candles_and_fill_the_window_with_t
     assert logged[-1] == ("info", "Added 3 trades. 60 second rolling window metrics calculated")
 
 
+def test_startup_fetch_joins_candles_and_trades_where_no_trade_can_straddle(monkeypatch):
+    # The first live trade is in minute 2. Trade 9 started 50 ms before minute 2, so some of its fills may
+    # be in minute 2, which Binance's candle for minute 1 leaves out: the trades take over from minute 1.
+    first_live = make_trade(11, 100, MIDNIGHT_MS + 2 * metrics.MINUTE_MS + 500)
+    trades = [make_trade(8, 90, MIDNIGHT_MS + 90_000, quantity=2),
+              make_trade(9, 95, MIDNIGHT_MS + 2 * metrics.MINUTE_MS - 50, quantity=4),
+              make_trade(10, 99, MIDNIGHT_MS + 2 * metrics.MINUTE_MS + 100), first_live]
+    # Binance's minute 1 has trade 8 and 1 of trade 9's 4: joining at minute 2 would lose the other 3.
+    candles = [make_candle(MIDNIGHT_MS, 5, 500, 2, 200), make_candle(MIDNIGHT_MS + metrics.MINUTE_MS, 3, 275, 3, 275)]
+    rest = fake_rest(trades)
+    asked = []
+
+    async def get_json(path, params, log):
+        asked.append(path)
+        if path == "/fapi/v1/klines":
+            return [c for c in candles if params["startTime"] <= c[0] <= params["endTime"]]
+        return await rest(path, params, log)
+
+    monkeypatch.setattr(metrics, "get_json", get_json)
+    fetch = lambda: asyncio.run(metrics.fetch_earlier_trades("XAUUSDT", MIDNIGHT_MS, first_live, lambda *_: None))
+    *totals, candle_count, trade_count, _, _ = fetch()
+    # Minute 0's candle, then trades 8, 9 and 10 whole (all buys): pv 500 + 180 + 380 + 99, volume 5 + 2 + 4 + 1.
+    assert totals == [1159, 12, 859, 9] and (candle_count, trade_count) == (1, 3)
+
+    # If minute 1 can be straddled too (trade 7, 30 ms before it), the trades take over from the session start.
+    trades.insert(0, make_trade(7, 80, MIDNIGHT_MS + metrics.MINUTE_MS - 30))
+    asked.clear()
+    *totals, candle_count, trade_count, _, _ = fetch()
+    assert totals == [739, 8, 739, 8] and (candle_count, trade_count) == (0, 4)
+    assert "/fapi/v1/klines" not in asked
+
+
 def test_session_open_is_the_earliest_trade_found_and_resets_each_session():
     tracker = metrics.SessionTracker()
     tracker.add_trade(101, 1, MIDNIGHT_MS + 5_000, True)  # first live trade
@@ -757,18 +789,22 @@ def assert_matches_official(tracker, boundary_ms):
 
 
 async def receive_until_boundary(asset, ws, ready):
-    """Feed live trades in until ready() is true, then stop at the next minute boundary.
+    """Feed live trades in until ready() is true, then stop at the next minute boundary no trade straddles.
 
-    The trade that crosses the boundary is not added, so our totals cover exactly
-    the same span as the closed candles. Returns the boundary time.
+    The trade that crosses the boundary is not added, so our totals cover exactly the
+    same span as the closed candles. A boundary with a trade in the AGG_WINDOW_MS before
+    it is passed over: that trade's fills can run past it, into the next candle.
+    Returns the boundary time.
     """
     boundary_ms = None
     async for message in ws:
         trade = json.loads(message)["data"]
         if boundary_ms is None and ready():
             boundary_ms = trade["T"] - trade["T"] % metrics.MINUTE_MS + metrics.MINUTE_MS
-        if boundary_ms is not None and trade["T"] >= boundary_ms:
-            return boundary_ms
+        while boundary_ms is not None and trade["T"] >= boundary_ms:
+            if asset.tracker.candles.straddle_free(boundary_ms // metrics.MINUTE_MS):
+                return boundary_ms
+            boundary_ms += metrics.MINUTE_MS
         asset.handle_trade(trade)
 
 
@@ -779,7 +815,7 @@ def test_live_startup_fetch_matches_official_candles():
         async with websockets.connect(LIVE_URL) as ws:
             boundary_ms = await receive_until_boundary(
                 live, ws, lambda: live.backfill_task is not None and live.backfill_task.done())
-        await asyncio.sleep(3)  # let the last candle close on Binance's side
+        await asyncio.sleep(metrics.CHECK_DELAY_S)  # let the last candle settle on Binance's side, as the live check does
         return live, boundary_ms
 
     live, boundary_ms = asyncio.run(scenario())
@@ -804,7 +840,7 @@ def test_live_forced_reconnect_fills_gap_and_matches_official_candles():
                 handled_after.append(True)
                 return len(handled_after) > 1 and not live.checker.missing_ids and not live.fetch_tasks
             boundary_ms = await receive_until_boundary(live, ws, gap_filled)
-        await asyncio.sleep(3)
+        await asyncio.sleep(metrics.CHECK_DELAY_S)
         return live, boundary_ms, highest_before
 
     live, boundary_ms, highest_before = asyncio.run(scenario())

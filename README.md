@@ -32,6 +32,16 @@ exactly this and nothing else: only the last trade before a boundary, only if it
 within 100 ms of it, only by less than its own size, at its own price, and the next
 minute must then open with the rest of it.
 
+The same split matters in two more places:
+
+- **Midnight.** Binance's daily candle is the sum of its one-minute candles, so a trade
+  that straddles 00:00 is split between two days. On 2026-10-05, Binance's BTC day
+  starts with 0.004 BTC of a buy stamped on 10-04. The backtest moves that part out of
+  10-04's totals and into 10-05's, and both days then match to within 5e-12.
+- **Startup.** When the app starts mid-session, it takes Binance's one-minute candles up
+  to a minute start and the trades after it. It now picks a minute start with no trade
+  in the 100 ms before it, so no part of a trade can fall between the two.
+
 Right now it tracks three assets on Binance USDⓈ-M futures, **BTCUSDT**, **ETHUSDT**
 and **XAUUSDT** (gold). One combined stream connection carries every asset's trades,
 and every metric is updated on every aggregated trade. Each asset keeps its own totals,
@@ -122,8 +132,9 @@ Press Ctrl+C to stop.
 Replays a full day of every asset's trades from Binance's historical trade files and
 checks the day's VWAP, volume and buy volume against Binance's official daily candle,
 and every one-minute candle against its official one (defaults to yesterday, UTC; the
-files, about 40 MB for the three assets, are kept in `data/`). It exits with code 1 if
-any check fails.
+files, about 40 MB for the three assets, are kept in `data/`). On a day that starts with
+part of the previous day's last trade, it also downloads the previous day's file to read
+that trade. It exits with code 1 if any check fails.
 
 ```
 python backtest.py [YYYY-MM-DD] [--symbol BTCUSDT]
