@@ -49,9 +49,9 @@ seconds.
 
 ## Staying right when connections fail
 
-The maths is the easy part. The hard part of a live feed is that connections fail,
-often silently, and a dashboard that quietly drops trades still looks fine. This app is
-built so that every number is either complete or visibly marked as not yet complete.
+The app detects dropped connections, reconnects, and fetches any trades it missed. Every
+number on the page is either complete or marked as incomplete (yellow while missed
+trades are being fetched, grey while the page has lost its link to the app).
 
 **Noticing a dead connection.** A cut connection usually sends no signal: no error, just
 silence. The app pings Binance every second, so a dead connection is noticed within
@@ -85,7 +85,6 @@ marked with its asset (or SYSTEM for the connection, PAGE for the tab's own step
 
 ## Checked against Binance
 
-Filling gaps only matters if the result is actually right, so the app checks itself.
 Once each minute has finished, its candle (open, high, low, close and volume), built
 from the live trades, is compared with Binance's official one-minute candle. The page
 shows the running count ("Checked vs Binance: 312/312 minutes match"), and any mismatch
