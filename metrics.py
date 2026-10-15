@@ -33,6 +33,9 @@ first live trade) and shows VWAP in yellow until that fetch has been added.
 Every trade's aggregated ID is checked against the highest ID seen: duplicates are
 ignored, skipped IDs are fetched from REST, and late arrivals are added. When the
 connection ends, it reconnects with backoff and the ID check finds the gap.
+
+For demos, the internet connection can be cut on purpose (LiveFeed.simulate_cut, the
+page's "Simulate Wi-Fi cut" button), to watch the engine notice and recover.
 """
 
 import asyncio
@@ -66,13 +69,15 @@ MAX_RETRY_WAIT_S = 60
 MAX_TRADE_TIME_MS = int(datetime(3000, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 MAX_EVENTS = 500  # the debug console keeps this many of the latest events
 # Ping Binance this often; no pong within PING_TIMEOUT_S means the connection is dead.
-# A pong proves the connection works even when the market is quiet.
-PING_INTERVAL_S = 5
-PING_TIMEOUT_S = 5
+# A pong proves the connection works even when the market is quiet. A pong takes about
+# 0.3 s to come back (measured 2026-10-15), so the timeout leaves room for three. Pings
+# can't go much faster: Binance closes a connection that sends over 10 messages a second.
+PING_INTERVAL_S = 1
+PING_TIMEOUT_S = 1
 # When closing (e.g. after a missed pong) the library says goodbye and waits this long
 # for Binance to answer. A dead network never answers, so this adds to detection time;
-# a live one answers well within it. Worst case to notice a cut: 5 + 5 + 1 = 11 s.
-CLOSE_TIMEOUT_S = 1
+# by then the connection is already judged dead. Worst case to notice a cut: 1 + 1 + 0.5 = 2.5 s.
+CLOSE_TIMEOUT_S = 0.5
 # Each finished minute's candle is checked against Binance's official one. Binance's is
 # final a moment after the minute ends, so checks wait this long, and look every CHECK_POLL_S.
 CHECK_DELAY_S = 10
@@ -84,6 +89,20 @@ AGG_WINDOW_MS = 100
 
 YELLOW = "\033[33m"
 RESET_COLOR = "\033[0m"
+
+
+class Network:
+    """Whether the internet connection is cut on purpose, for demos (see LiveFeed.simulate_cut).
+
+    While it's cut, every REST request and new connection to Binance fails the way it
+    does with no internet. There's one for the whole program, like the real connection.
+    """
+
+    def __init__(self):
+        self.cut = False
+
+
+NETWORK = Network()
 
 
 def combined_stream_url(symbols):
@@ -418,6 +437,8 @@ class TradeIdChecker:
 
 def fetch_json(path, params):
     """One blocking GET request to Binance's REST API, returning the parsed JSON."""
+    if NETWORK.cut:
+        raise urllib.error.URLError("simulated Wi-Fi cut")  # what urlopen raises with no internet
     url = f"{REST_URL}{path}?{urllib.parse.urlencode(params)}"
     with urllib.request.urlopen(url, timeout=10) as response:
         return json.loads(response.read())
@@ -1153,6 +1174,7 @@ class LiveFeed:
         self.system = EventLog(None, self.emit_event)
         self.assets = {symbol: AssetTracker(symbol, self.emit_event, self.emit_trade) for symbol in symbols}
         self.connection = {"state": "connecting", "message": "Starting", "retry_at_ms": None}
+        self.ws = None  # the open Binance connection, if any
 
     def emit_event(self, event):
         if self.on_event:
@@ -1196,6 +1218,24 @@ class LiveFeed:
         self.connection = {"state": state, "message": message, "retry_at_ms": None}
         self.log(level, message)
 
+    def simulate_cut(self, cut):
+        """Cut the internet connection on purpose (True) or bring it back (False), for demos.
+
+        Nothing is faked from there on: the open connection stops reading, so neither
+        trades nor Binance's pongs get through and the ping timeout notices it like a
+        real cut (within ~2.5 s). Reconnects and REST requests fail and back off. Once
+        it's back, the next retry connects and each asset's ID check finds its gap.
+        """
+        if cut == NETWORK.cut:
+            return
+        NETWORK.cut = cut
+        if cut:
+            self.log("warning", "Simulated Wi-Fi cut: nothing reaches Binance or comes back until it's restored")
+            if self.ws is not None:
+                self.ws.transport.pause_reading()
+        else:
+            self.log("info", "Simulated Wi-Fi cut over: the next retry can reach Binance")
+
     def snapshot(self):
         """Everything a display needs, as plain values copied in one go.
 
@@ -1205,6 +1245,7 @@ class LiveFeed:
         """
         return {
             "connection": dict(self.connection),
+            "simulated_cut": NETWORK.cut,
             "assets": [asset.snapshot() for asset in self.assets.values()],
         }
 
@@ -1240,13 +1281,19 @@ class LiveFeed:
         while True:
             self.set_connection("connecting", "info", f"Connecting to {self.stream_url}")
             try:
+                if NETWORK.cut:
+                    raise OSError("simulated Wi-Fi cut")  # with no internet, connecting fails at once
                 async with websockets.connect(self.stream_url, ping_interval=self.ping_interval_s,
                                               ping_timeout=self.ping_timeout_s,
                                               close_timeout=self.close_timeout_s) as ws:
+                    self.ws = ws
                     self.set_connection("connected", "info", "Connected")
                     async for message in ws:
                         wait_s = 0
-                        self.handle_message(message)
+                        self.handle_message(message)  # received before a cut, so it counts
+                        if NETWORK.cut:
+                            # The library resumes reading once its buffer drains; stay deaf.
+                            ws.transport.pause_reading()
                 # A normal close (e.g. Binance's 24 hour limit) ends the loop without an error.
                 self.set_connection("closed", "info", "Binance closed the connection, reconnecting")
             except websockets.exceptions.ConnectionClosedError as error:
@@ -1256,6 +1303,7 @@ class LiveFeed:
             except OSError as error:
                 self.set_connection("unreachable", "warning",
                                     f"Can't reach Binance, check the internet connection ({error})")
+            self.ws = None
 
             if wait_s > 0:
                 self.connection["retry_at_ms"] = now_ms() + wait_s * 1000

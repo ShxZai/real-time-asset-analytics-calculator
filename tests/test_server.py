@@ -69,6 +69,24 @@ def test_events_feed_sends_history_then_each_new_event():
     asyncio.run(scenario())
 
 
+def test_quiet_events_feed_sends_heartbeats_so_the_page_can_spot_a_dead_link(monkeypatch):
+    monkeypatch.setattr(server, "HEARTBEAT_INTERVAL_S", 0.1)
+
+    async def scenario():
+        live = metrics.LiveFeed(["XAUUSDT"])
+        async with running_server(live) as address:
+            async with websockets.connect(f"ws://{address}/ws/events") as ws:
+                assert (await receive(ws))["type"] == "history"
+                assert await receive(ws) == {"type": "heartbeat"}  # nothing happened: a heartbeat instead
+                live.log("info", "something")
+                message = await receive(ws)
+                while message["type"] == "heartbeat":  # one may already be on its way
+                    message = await receive(ws)
+                assert message["event"]["message"] == "something"
+
+    asyncio.run(scenario())
+
+
 def test_pages_joining_while_events_happen_miss_nothing_and_get_nothing_twice():
     async def scenario():
         live = metrics.LiveFeed()
@@ -212,15 +230,44 @@ def test_page_too_far_behind_is_closed_so_it_reconnects():
     asyncio.run(scenario())
 
 
+def post(url):
+    """POST to url in a thread (urllib blocks); return (status, JSON body)."""
+    def send():
+        with urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=5) as response:
+            return response.status, json.loads(response.read())
+    return asyncio.to_thread(send)
+
+
+def test_simulated_cut_endpoints_switch_the_cut_and_the_state_shows_it(monkeypatch):
+    monkeypatch.setattr(metrics.NETWORK, "cut", False)  # put back after the test
+
+    async def scenario():
+        live = metrics.LiveFeed(["XAUUSDT"])
+        async with running_server(live) as address:
+            async with websockets.connect(f"ws://{address}/ws/state") as ws:
+                assert (await receive(ws))["simulated_cut"] is False
+                assert await post(f"http://{address}/simulated-cut/start") == (200, {"simulated_cut": True})
+                assert (await receive(ws))["simulated_cut"] is True
+                assert await post(f"http://{address}/simulated-cut/start") == (200, {"simulated_cut": True})
+                assert await post(f"http://{address}/simulated-cut/stop") == (200, {"simulated_cut": False})
+                assert (await receive(ws))["simulated_cut"] is False
+        cut_events = [e["message"] for e in live.events() if "Simulated Wi-Fi cut" in e["message"]]
+        assert len(cut_events) == 2  # pressing start twice is one cut
+
+    asyncio.run(scenario())
+
+
 def test_page_is_served():
     async def scenario():
         async with running_server(metrics.LiveFeed()) as address:
             def fetch(path):
                 with urllib.request.urlopen(f"http://{address}{path}", timeout=5) as response:
-                    return response.status, response.read().decode()
-            status, html = await asyncio.to_thread(fetch, "/")
+                    return response.status, response.read().decode(), response.headers["Cache-Control"]
+            status, html, cache = await asyncio.to_thread(fetch, "/")
             assert status == 200 and "/static/app.js" in html and "lightweight-charts" in html
-            status, script = await asyncio.to_thread(fetch, "/static/app.js")
+            assert cache == "no-cache"
+            status, script, cache = await asyncio.to_thread(fetch, "/static/app.js")
             assert status == 200 and "/ws/state" in script
+            assert cache == "no-cache"  # so an updated app.js is never left behind in the browser's cache
 
     asyncio.run(scenario())

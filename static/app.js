@@ -11,8 +11,19 @@
 // shows one large and the other small underneath; the unit switch swaps them.
 //
 // Clicking an asset's row opens its price chart (Lightweight Charts) and more numbers underneath.
+//
+// The "Simulate Wi-Fi cut" button cuts the engine's connection to Binance on purpose
+// and brings it back. Its label follows the state, so every open page agrees.
+//
+// A cut link sends no signal, so the page doesn't wait to be told: the server sends
+// something on each feed at least every second, and a feed silent for SILENCE_LIMIT_MS
+// counts as lost. The "Simulate app disconnect" button cuts this page's link to the
+// app (this tab only): nothing from the server is taken in, reconnects and requests
+// fail, and the silence check has to notice, as it would for a real cut.
 
 const RECONNECT_WAITS_MS = [1000, 2000, 4000, 5000]; // then 5 s each time
+// State comes every 0.3 s and the events feed sends a heartbeat after 1 s without an event.
+const SILENCE_LIMIT_MS = 2000;
 const MAX_CONSOLE_ROWS = 500; // same as the engine keeps
 
 const el = (id) => document.getElementById(id);
@@ -26,6 +37,10 @@ let lastEventIds = new Map(); // highest event ID shown in the console, per log
 const rows = new Map(); // symbol -> that asset's table cells
 let eventQueue = Promise.resolve(); // handles event messages one after another, in order
 let mainUnit = loadMainUnit(); // "quote" (USDT) or "base" (the coin): which volume is shown large
+let cutRequestPending = false; // a press of the Wi-Fi cut button is on its way to the server
+let appCut = false; // this page's link to the app is cut on purpose ("Simulate app disconnect")
+// The page's own events (its links to the app), kept across console rebuilds.
+const pageEvents = [];
 
 // The unit choice is remembered in this browser only; storage can be unavailable (private windows).
 function loadMainUnit() {
@@ -47,6 +62,11 @@ function setMainUnit(unit) {
     button.setAttribute("aria-pressed", String(button.dataset.unit === unit));
   }
   render();
+}
+
+// fetch() to the app, failing the way it does when the app can't be reached during a simulated disconnect.
+function appFetch(url, options) {
+  return appCut ? Promise.reject(new TypeError("simulated app disconnect")) : fetch(url, options);
 }
 
 // Change an element only when the new value differs from what it shows.
@@ -76,6 +96,8 @@ function render() {
     const wait = stateRetryAt ? ` (retrying in ${secondsUntil(stateRetryAt)} s)` : "";
     setStatus(el("app-status"), "App: lost connection" + wait, "bad");
   }
+  renderCutButton();
+  renderAppCutButton();
   if (!state) return;
 
   // Binance connection (one for every asset). While the app is unreachable, the page can't know it.
@@ -370,7 +392,7 @@ function toBars(rows) {
 async function loadCandles(panel) {
   panel.loading = true;
   try {
-    const response = await fetch(`/candles/${encodeURIComponent(panel.symbol)}`);
+    const response = await appFetch(`/candles/${encodeURIComponent(panel.symbol)}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (detail !== panel) return; // closed while loading
@@ -492,6 +514,15 @@ function addConsoleRow(time, log, text, isWarning) {
   if (atBottom) consoleList.scrollTop = consoleList.scrollHeight;
 }
 
+// An event of the page itself (its links to the app). The server can't record these:
+// they happen exactly when it can't be reached.
+function pageLog(text, isWarning = false) {
+  const row = { time_ms: Date.now(), text, isWarning };
+  pageEvents.push(row);
+  if (pageEvents.length > MAX_CONSOLE_ROWS) pageEvents.shift();
+  addConsoleRow(formatTime(row.time_ms), "page", text, isWarning);
+}
+
 function addEvent(event) {
   addConsoleRow(formatTime(event.time_ms), logName(event), event.message, event.level === "warning");
   lastEventIds.set(logName(event), event.id);
@@ -499,7 +530,7 @@ function addEvent(event) {
 
 async function fetchEvent(log, id) {
   try {
-    const response = await fetch(`/events/${encodeURIComponent(log)}/${id}`);
+    const response = await appFetch(`/events/${encodeURIComponent(log)}/${id}`);
     return response.ok ? await response.json() : null;
   } catch {
     return null; // the server is unreachable; the console says the event is missing
@@ -511,7 +542,13 @@ async function handleEventMessage(message) {
     // Rebuild on every connect: this also covers a restarted server, whose IDs start again at 0.
     consoleList.replaceChildren();
     lastEventIds = new Map();
-    message.events.forEach(addEvent); // each log's events arrive in ID order
+    // The server's events (each log in ID order) and the page's own, in time order (a stable sort keeps each log's order).
+    const rows = [...message.events.map((event) => ({ time_ms: event.time_ms, event })), ...pageEvents]
+      .sort((a, b) => a.time_ms - b.time_ms);
+    for (const row of rows) {
+      if (row.event) addEvent(row.event);
+      else addConsoleRow(formatTime(row.time_ms), "page", row.text, row.isWarning);
+    }
     setText(el("event-count"), String(consoleList.children.length));
     return;
   }
@@ -532,30 +569,114 @@ async function handleEventMessage(message) {
   addEvent(event);
 }
 
+// ---- Simulated Wi-Fi cut ----
+
+function renderCutButton() {
+  const button = el("cut-button");
+  const cut = Boolean(state && state.simulated_cut);
+  setText(button, cut ? "Restore Wi-Fi" : "Simulate Wi-Fi cut");
+  setClass(button, "active", cut);
+  button.setAttribute("aria-pressed", String(cut));
+  const disabled = !stateOpen || !state || cutRequestPending;
+  if (button.disabled !== disabled) button.disabled = disabled;
+}
+
+async function toggleCut() {
+  const action = state.simulated_cut ? "stop" : "start";
+  cutRequestPending = true;
+  render();
+  try {
+    await appFetch(`/simulated-cut/${action}`, { method: "POST" });
+  } catch {
+    // the app is unreachable; the button follows the state once it's back
+  }
+  // Keep the button disabled until a state message shows the change, so a quick second press can't undo it.
+  const wanted = action === "start";
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && stateOpen && state.simulated_cut !== wanted) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  cutRequestPending = false;
+  render();
+}
+
+el("cut-button").addEventListener("click", toggleCut);
+
+// ---- Simulated app disconnect (this page only) ----
+
+function renderAppCutButton() {
+  const button = el("app-cut-button");
+  setText(button, appCut ? "Restore app connection" : "Simulate app disconnect");
+  setClass(button, "active", appCut);
+  button.setAttribute("aria-pressed", String(appCut));
+}
+
+el("app-cut-button").addEventListener("click", () => {
+  appCut = !appCut;
+  pageLog(appCut ? "Simulated app disconnect: nothing from the app gets through until it's restored"
+                 : "Simulated app disconnect over: the next retry can reach the app", appCut);
+  render();
+});
+
 // ---- Connections ----
 
-// Open a WebSocket to the server and keep reopening it when it closes.
-function keepConnected(path, onOpen, onMessage, onClose) {
+// Open a WebSocket to the server and keep reopening it when it closes, or when
+// nothing has come for SILENCE_LIMIT_MS (a cut link never closes by itself).
+// name labels the feed in the console.
+function keepConnected(name, path, onOpen, onMessage, onClose) {
   let attempt = 0;
+  let socket = null; // the open (or opening) WebSocket
+  let lastHeardAt = 0;
+
+  function retryLater(reason) {
+    const wait = RECONNECT_WAITS_MS[Math.min(attempt, RECONNECT_WAITS_MS.length - 1)];
+    attempt++;
+    pageLog(`${name} feed: ${reason}; retrying in ${wait / 1000} s`, true);
+    onClose(Date.now() + wait);
+    setTimeout(open, wait);
+  }
+
   function open() {
+    if (appCut) {
+      retryLater("can't reach the app (simulated app disconnect)");
+      return;
+    }
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${scheme}://${location.host}${path}`);
+    socket = ws;
+    lastHeardAt = Date.now();
     ws.onopen = () => {
       attempt = 0;
+      lastHeardAt = Date.now();
+      if (pageEvents.length) pageLog(`${name} feed: connected`); // not on first load: nothing was lost
       onOpen();
     };
-    ws.onmessage = (message) => onMessage(JSON.parse(message.data));
+    ws.onmessage = (message) => {
+      if (appCut) return; // the link is cut: this never arrived
+      lastHeardAt = Date.now();
+      onMessage(JSON.parse(message.data));
+    };
     ws.onclose = () => {
-      const wait = RECONNECT_WAITS_MS[Math.min(attempt, RECONNECT_WAITS_MS.length - 1)];
-      attempt++;
-      onClose(Date.now() + wait);
-      setTimeout(open, wait);
+      if (socket !== ws) return; // already given up on by the silence check
+      socket = null;
+      retryLater("connection closed");
     };
   }
+
+  setInterval(() => {
+    const silentMs = Date.now() - lastHeardAt;
+    if (socket && socket.readyState === WebSocket.OPEN && silentMs > SILENCE_LIMIT_MS) {
+      const dead = socket;
+      socket = null; // so its own close event, whenever it comes, is ignored
+      dead.close();
+      retryLater(`nothing received for ${(silentMs / 1000).toFixed(1)} s`);
+    }
+  }, 100);
   open();
 }
 
 keepConnected(
+  "State",
   "/ws/state",
   () => { stateOpen = true; stateRetryAt = null; },
   (message) => { state = message; render(); },
@@ -563,9 +684,13 @@ keepConnected(
 );
 
 keepConnected(
+  "Events",
   "/ws/events",
   () => setText(el("console-status"), ""),
-  (message) => { eventQueue = eventQueue.then(() => handleEventMessage(message)); },
+  (message) => {
+    if (message.type === "heartbeat") return; // only there to show the link is alive
+    eventQueue = eventQueue.then(() => handleEventMessage(message));
+  },
   () => setText(el("console-status"), " - disconnected, reconnecting"),
 );
 

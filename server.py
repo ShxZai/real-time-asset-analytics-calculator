@@ -10,6 +10,9 @@ every open page shares one Binance connection. A page opens two WebSockets:
   The page compares it with what it shows and changes only what differs.
 - /ws/events: the latest events of every log first (history), then each new event
   as it happens. The page rebuilds its console from the history on every connect.
+  When no event has gone out for HEARTBEAT_INTERVAL_S, it sends a heartbeat, so
+  both feeds send something at least every second and the page can treat a longer
+  silence as a lost connection (a cut link sends no signal of its own).
 
 GET /candles/{symbol} returns the session's one-minute candles for an asset's price
 chart. The state message carries only the latest two (the ones still changing) and a
@@ -18,6 +21,11 @@ revision that changes when any older one does, so the page knows when to load th
 Each asset and the system have their own event log with their own IDs, so an event
 is named by (symbol, id). GET /events/{symbol}/{id} returns one event that's still
 kept ("system" for the system log), so a page can fetch an ID it didn't receive.
+
+POST /simulated-cut/start and /simulated-cut/stop cut the engine's internet connection
+on purpose and bring it back, for the page's "Simulate Wi-Fi cut" button. Only the
+engine's link to Binance is cut; the page keeps receiving the state, so it shows
+the engine noticing the cut and recovering. Every open page shares it, like the engine.
 """
 
 import argparse
@@ -37,6 +45,7 @@ HOST = "127.0.0.1"  # only this machine can open the page
 PORT = 8000  # tried first; if it's taken, the next ones up to PORT + PORT_TRIES - 1
 PORT_TRIES = 20
 STATE_INTERVAL_S = 0.3
+HEARTBEAT_INTERVAL_S = 1  # /ws/events sends a heartbeat after this long without an event
 # A page this many events behind is cut off; it reconnects and rebuilds from history.
 PAGE_QUEUE_SIZE = 1000
 STATIC_DIR = Path(__file__).parent / "static"
@@ -86,6 +95,19 @@ class EventFanOut:
                 queue.put_nowait(None)
 
 
+class FreshStaticFiles(StaticFiles):
+    """Static files the browser checks for a newer version on every page load.
+
+    Without this, a browser can keep running a cached app.js after an update, next to
+    the new index.html. The check is cheap: an unchanged file comes back as 304, with no body.
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def create_app(live, run_engine=True):
     """Build the web app around an engine. Tests pass run_engine=False and drive it themselves."""
     fan_out = EventFanOut(live)
@@ -100,11 +122,11 @@ def create_app(live, run_engine=True):
                 await engine
 
     app = FastAPI(lifespan=lifespan)
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", FreshStaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/")
     async def page():
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
     @app.get("/events/{symbol}/{event_id}")
     async def get_event(symbol: str, event_id: int):
@@ -123,6 +145,16 @@ def create_app(live, run_engine=True):
             raise HTTPException(404, f"{symbol} isn't tracked")
         return asset.chart()
 
+    @app.post("/simulated-cut/start")
+    async def start_simulated_cut():
+        live.simulate_cut(True)
+        return {"simulated_cut": True}
+
+    @app.post("/simulated-cut/stop")
+    async def stop_simulated_cut():
+        live.simulate_cut(False)
+        return {"simulated_cut": False}
+
     @app.websocket("/ws/state")
     async def state_feed(ws: WebSocket):
         async def send_states():
@@ -138,7 +170,11 @@ def create_app(live, run_engine=True):
         async def send_events():
             await ws.send_json({"type": "history", "events": history})
             while True:
-                event = await queue.get()
+                try:
+                    event = await asyncio.wait_for(queue.get(), HEARTBEAT_INTERVAL_S)
+                except TimeoutError:
+                    await ws.send_json({"type": "heartbeat"})
+                    continue
                 if event is None:
                     await ws.close(TRY_AGAIN_LATER, "Too far behind, reconnect")
                     return

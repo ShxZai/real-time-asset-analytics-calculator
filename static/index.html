@@ -82,6 +82,16 @@
     }
     .switch button[aria-pressed="true"] { background: var(--line); color: var(--text); }
     .switch button:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+    /* Cut a connection on purpose (the engine's to Binance, or this page's to the app), to watch it notice and recover. */
+    .sim-button {
+      font: inherit; padding: 2px 10px; cursor: pointer;
+      background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 4px;
+    }
+    #cut-button { margin-left: auto; }
+    .sim-button:hover:not(:disabled) { color: var(--text); }
+    .sim-button.active { color: var(--red); border-color: var(--red); }
+    .sim-button:disabled { cursor: default; opacity: 0.5; }
+    .sim-button:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
 
     .legend { color: var(--muted); margin: 12px 0 0; }
     .legend .swatch { color: var(--yellow); }
@@ -134,6 +144,10 @@
       <button type="button" data-unit="quote" aria-pressed="true">USDT</button>
       <button type="button" data-unit="base" aria-pressed="false">Coin</button>
     </span>
+    <button type="button" id="cut-button" class="sim-button" disabled
+            title="Cuts the app's connection to Binance (stream and REST) as a Wi-Fi cut would; press again to bring it back">Simulate Wi-Fi cut</button>
+    <button type="button" id="app-cut-button" class="sim-button"
+            title="Cuts this page's connection to the app (this tab only), as if the app stopped answering; press again to bring it back">Simulate app disconnect</button>
   </div>
 
   <div id="table-wrap" class="table-wrap">
@@ -172,6 +186,12 @@
     <span class="swatch">Yellow</span>: trades still being fetched after a gap, not final.
     Grey: not live (reconnecting, or the app is unreachable).
     Checked vs Binance: each finished minute's candle is compared with Binance's official one; mismatches go to the debug console.
+    Simulate Wi-Fi cut: within ~2.5 s the missed pings show the connection is dead, and retries back off. After you
+    restore it, the next retry reconnects, each asset fetches the trades it missed (yellow until they're in),
+    and the minutes of the cut are then checked against Binance like any other. Open the debug console to follow along.
+    Simulate app disconnect (this tab only): within ~2 s of hearing nothing from the app, the page counts it as lost,
+    greys the numbers and retries (1, 2, 4, 5 s); after you restore it, it reconnects and catches up at once, as the
+    app kept running. The console shows these steps as PAGE.
   </p>
 
   <!-- TradingView's open-source chart library; the page feeds it the engine's own candles and VWAP. -->

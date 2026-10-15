@@ -5,6 +5,22 @@
 Turns a live market data feed into metrics as trades happen, and proves they're right
 against the exchange's own figures, minute by minute.
 
+## Break it yourself
+
+The hardest part of a live feed isn't the maths, it's staying right when connections
+fail. Two buttons on the live page let you test that yourself, with nothing scripted:
+
+- **Simulate Wi-Fi cut** cuts the app's connection to Binance. Within about 2.5
+  seconds the missed pings show the connection is dead, and retries back off.
+  After you restore it, each asset's trade ID check finds the trades it missed and
+  fetches them, so every number is complete again, and those minutes are then checked
+  against Binance's official candles like any other.
+- **Simulate app disconnect** cuts this browser tab's connection to the app. The page
+  notices within about 2 seconds of silence, greys out the numbers it can no longer
+  trust, retries, and catches up the moment it's back.
+
+The debug console shows each step as it happens. See [Run](#run) for how each one works.
+
 ## Results
 
 Replaying a full day of trades (`python backtest.py 2026-10-14`) through the same code
@@ -91,8 +107,10 @@ It currently also:
   yellow until they're included)
 - checks every aggregated trade ID, ignoring duplicates and fetching any missed trades
 - reconnects automatically when the connection drops, with backoff up to one minute
-- pings Binance every 5 seconds, so a silently cut connection is noticed within
-  about 11 seconds even when the market is quiet
+- pings Binance every second, so a silently cut connection is noticed within
+  about 2.5 seconds even when the market is quiet (a pong takes about 0.3 s to come
+  back, and Binance closes connections that send more than 10 messages a second, so
+  pings can't usefully go much faster)
 - skips malformed messages (if one was a real trade, it's fetched like any missed trade)
 - starts a failed fetch again rather than dropping it, so VWAP never leaves out
   trades without showing in yellow
@@ -122,6 +140,29 @@ low, range, total volume and buy share. The candles are built from the same trad
 as every other metric (and from Binance's 1m candles for the part of the session
 before the app started), so the chart and the table always agree. The chart uses
 TradingView's open-source [Lightweight Charts](https://github.com/tradingview/lightweight-charts) library.
+
+**Simulate Wi-Fi cut.** A button on the page cuts the app's connection to Binance on
+purpose, so you can watch it recover without touching your Wi-Fi. Nothing about the
+recovery is faked: the open connection stops reading, so trades and Binance's replies
+to pings stop arriving, and new connections and REST requests fail as they would
+offline. Within about 2.5 seconds the missed pings show the connection is dead
+("Binance: can't reach"), and retries back off (5 s, 10 s, 20 s, ...). Press **Restore
+Wi-Fi** and the next retry reconnects. Each asset's trade ID check then finds the
+trades it missed, fetches them (the numbers are yellow until they're in), and those
+minutes are checked against Binance like any other. The debug console shows each step.
+Only the link to Binance is cut, never the page's link to the app, so the page keeps
+showing what the engine sees.
+
+**Simulate app disconnect.** A second button cuts the other link: this browser tab's
+connection to the app (other tabs aren't affected). A cut link sends no signal, so
+the page doesn't wait to be told. Both of its feeds from the app send something at
+least every second (state every 0.3 s; the event feed sends a heartbeat when it has
+nothing else), and a feed silent for 2 seconds counts as lost. The numbers turn grey,
+the Binance pill shows "unknown" (the page can no longer know), and the page retries
+after 1, 2, 4 and then every 5 seconds. Once restored it reconnects, gets the full
+state and rebuilds the debug console from the app's history, so it catches up at once:
+the app kept running and nothing was missed. The page's own steps show in the console
+as PAGE.
 
 For terminal output instead, run `python metrics.py`.
 

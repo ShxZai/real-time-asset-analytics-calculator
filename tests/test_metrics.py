@@ -76,12 +76,15 @@ class FakeBinance:
     refuse_first: how many connection attempts get their handshake refused (HTTP 403).
     deaf_first: how many accepted connections go silent after their trades: no close
     and no pong, like a cut network.
+    hold_first: how many accepted connections stay open after their trades until the
+    engine goes away, instead of closing normally.
     """
 
-    def __init__(self, connections, refuse_first=0, deaf_first=0):
+    def __init__(self, connections, refuse_first=0, deaf_first=0, hold_first=0):
         self.connections = connections
         self.refuse_first = refuse_first
         self.deaf_first = deaf_first
+        self.hold_first = hold_first
         self.attempts = 0
         self.accepted = 0
 
@@ -104,7 +107,7 @@ class FakeBinance:
             ws.transport.resume_reading()  # now notice the engine has gone, so shutdown is quick
             await ws.wait_closed()
             return
-        if self.accepted < len(self.connections):
+        if self.accepted < len(self.connections) and self.accepted > self.hold_first:
             return  # returning closes the connection normally
         await ws.wait_closed()  # keep the last connection open until the server shuts down
 
@@ -126,9 +129,10 @@ async def wait_until(condition, timeout_s=5):
     await asyncio.wait_for(poll(), timeout_s)
 
 
-async def play(fake, done, symbols=("XAUUSDT",), **live_settings):
+async def play(fake, done, symbols=("XAUUSDT",), during=None, **live_settings):
     """Run a LiveFeed against the fake server until done(live) is true, then stop it.
 
+    during: an optional async function given the LiveFeed, run alongside it (to act mid-run).
     Returns the LiveFeed and the list of reconnect waits it asked for.
     """
     async with websockets.serve(fake.handler, "127.0.0.1", 0, process_request=fake.process_request) as server:
@@ -142,11 +146,14 @@ async def play(fake, done, symbols=("XAUUSDT",), **live_settings):
 
         live.sleep = record_wait
         run_task = asyncio.create_task(live.run())
+        during_tasks = [asyncio.create_task(during(live))] if during else []
         try:
             await wait_until(lambda: done(live))
+            for task in during_tasks:
+                await task  # raises if it failed
         finally:
             check_tasks = [task for asset in live.assets.values() for task in asset.check_tasks]
-            for task in [run_task, *live.fetch_tasks, *check_tasks]:
+            for task in [run_task, *during_tasks, *live.fetch_tasks, *check_tasks]:
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await run_task
@@ -228,6 +235,46 @@ def test_connection_that_stops_answering_pings_is_dropped_and_reconnected(monkey
     assert waits == [0]
     assert xau(live).tracker.cumulative_volume == 3
     assert live.connection["state"] == "connected"
+
+
+def test_simulated_cut_is_noticed_by_pings_backs_off_and_recovers_the_gap(monkeypatch):
+    monkeypatch.setattr(metrics.NETWORK, "cut", False)  # put back after the test
+    t = MIDNIGHT_MS + 60_000
+    trades = [make_trade(i, 100 + i, t + i) for i in range(6)]
+    monkeypatch.setattr(metrics, "get_json", fake_rest(trades))
+    # Trades 0-1, then the connection stays open (Binance doesn't know about the cut).
+    # After the cut, trade 5: IDs 2-4 were missed and must be fetched.
+    fake = FakeBinance([trades[:2], trades[5:]], hold_first=1)
+    # Retries don't really wait here, so the cut logs more events than the logs keep: record them all.
+    messages = []
+
+    async def cut_then_restore(live):
+        live.on_event = lambda event: messages.append(event["message"])
+        await wait_until(lambda: xau(live).checker.highest_id == 1)
+        live.simulate_cut(True)
+        await wait_until(lambda: live.connection["state"] == "unreachable")
+        live.simulate_cut(False)
+
+    def recovered(live):
+        return xau(live).checker.highest_id == 5 and all_counted(live)
+
+    live, waits = asyncio.run(play(fake, recovered, during=cut_then_restore,
+                                   ping_interval_s=0.2, ping_timeout_s=0.2, close_timeout_s=0.2))
+
+    dropped = [m for m in messages if m.startswith("Connection dropped")]
+    assert len(dropped) == 1 and "ping timeout" in dropped[0]  # noticed by the missed pong, not told
+    assert any("simulated Wi-Fi cut" in m and m.startswith("Can't reach") for m in messages)
+    assert waits[:2] == [0, 5]  # retried at once, then backed off
+    assert fake.accepted == 2  # no connection got through during the cut
+    assert xau(live).tracker.cumulative_volume == 6  # the missed trades 2-4 were fetched
+    assert math.isclose(xau(live).tracker.vwap, 102.5)  # (100 + ... + 105) / 6
+    assert live.connection["state"] == "connected" and live.snapshot()["simulated_cut"] is False
+
+
+def test_simulated_cut_makes_rest_requests_fail_like_no_internet(monkeypatch):
+    monkeypatch.setattr(metrics.NETWORK, "cut", True)
+    with pytest.raises(urllib.error.URLError, match="simulated Wi-Fi cut"):
+        metrics.fetch_json("/fapi/v1/time", {})  # fails before any request is made
 
 
 # ---------- gap across midnight (offline, fake server + fake REST) ----------
