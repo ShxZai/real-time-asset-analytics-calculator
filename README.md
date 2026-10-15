@@ -1,6 +1,36 @@
 # Real-Time Asset Analytics Calculator
 
-Turns a live market data feed into metrics as trades happen.
+![Tests](https://github.com/ShxZai/real-time-asset-analytics-calculator/actions/workflows/tests.yml/badge.svg)
+
+Turns a live market data feed into metrics as trades happen, and proves they're right
+against the exchange's own figures, minute by minute.
+
+## Results
+
+Replaying a full day of trades (`python backtest.py 2026-10-14`) through the same code
+the live app runs, then comparing with Binance's official candles:
+
+| Asset | Aggregated trades | Day VWAP vs Binance (relative difference) | One-minute candles matching Binance | Trades split across a minute boundary |
+|---|---:|---:|---:|---:|
+| BTCUSDT | 1,280,357 | 5.2e-12 | 1,440 / 1,440 | 90 |
+| ETHUSDT | 1,300,812 | 2.0e-12 | 1,440 / 1,440 | 89 |
+| XAUUSDT | 623,364 | 6.5e-13 | 1,440 / 1,440 | 30 |
+
+A candle matches when its open, high, low and close are equal and its volume (in coins
+and in USDT) agrees to 1e-9. The same check runs live on every finished minute.
+2026-10-13 gives the same result (every minute matches; 101, 83 and 24 split trades).
+
+**Trades split across a minute boundary.** The first version of the per-minute check
+failed on about 12% of BTC and ETH minutes, always in pairs: one minute had a little too
+much volume and the next exactly that much too little. Binance merges fills at the same
+price and taker side within 100 ms into one *aggregated trade*, stamped with its first
+fill's time, but its candles count each fill in the minute it happened. So when such a
+trade starts just before a boundary, Binance's candles split it between two minutes,
+while the aggregated feed can only put it in one. In the day's data every split trade
+started at most 96 ms before the boundary and had several fills. The check now allows
+exactly this and nothing else: only the last trade before a boundary, only if it started
+within 100 ms of it, only by less than its own size, at its own price, and the next
+minute must then open with the rest of it.
 
 Right now it tracks three assets on Binance USDⓈ-M futures, **BTCUSDT**, **ETHUSDT**
 and **XAUUSDT** (gold). One combined stream connection carries every asset's trades,
@@ -37,6 +67,14 @@ picks which one is shown large. When the app starts, it also fetches the trades 
 connected, so the rolling metrics are ready within seconds (they show "Warming up"
 until that fetch is in).
 
+**Checked against Binance while it runs.** Once each minute has finished, its candle
+(open, high, low, close and volume), built from the live trades, is compared with
+Binance's official one-minute candle, allowing for a trade split across a minute
+boundary (see Results). The page shows the running count ("Checked vs Binance:
+312/312 minutes match") and any mismatch goes to the debug console. A minute is only
+checked once it can't still change: no trade IDs missing, a live trade after it (so a
+silently dead connection can't hide a trade), and 10 s for Binance's candle to settle.
+
 It currently also:
 
 - fetches the session's earlier trades when started mid-session (VWAP is shown in
@@ -66,17 +104,29 @@ Then open the address it prints: http://127.0.0.1:8000, or the next free port
 state of every asset every 300 ms and each event as it happens over WebSockets,
 shows when Binance or the app is disconnected and how long ago each asset last
 traded, and has a debug console listing gaps, duplicates and reconnects, each
-marked with its asset (or SYSTEM for the connection). For terminal output instead, run `python metrics.py`.
+marked with its asset (or SYSTEM for the connection).
+
+Click a row to open that asset's price chart underneath: one-minute candles since
+00:00 UTC with the session VWAP drawn as a line, next to the session's open, high,
+low, range, total volume and buy share. The candles are built from the same trades
+as every other metric (and from Binance's 1m candles for the part of the session
+before the app started), so the chart and the table always agree. The chart uses
+TradingView's open-source [Lightweight Charts](https://github.com/tradingview/lightweight-charts) library.
+
+For terminal output instead, run `python metrics.py`.
 
 Press Ctrl+C to stop.
 
 ## Backtest
 
-Recomputes a full day's XAUUSDT VWAP and buy volume from Binance's historical trade file
-and checks them against Binance's official daily figures (defaults to yesterday, UTC):
+Replays a full day of every asset's trades from Binance's historical trade files and
+checks the day's VWAP, volume and buy volume against Binance's official daily candle,
+and every one-minute candle against its official one (defaults to yesterday, UTC; the
+files, about 40 MB for the three assets, are kept in `data/`). It exits with code 1 if
+any check fails.
 
 ```
-python backtest.py [YYYY-MM-DD]
+python backtest.py [YYYY-MM-DD] [--symbol BTCUSDT]
 ```
 
 ## Tests
@@ -103,4 +153,3 @@ country first. The live app (`server.py` and `metrics.py`) needs this too.
 ## Roadmap
 
 - More metrics (VWAP bands, large-trade alerts, order-book imbalance)
-- Click a row to expand a price chart

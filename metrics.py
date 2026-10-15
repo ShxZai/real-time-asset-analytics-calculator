@@ -13,6 +13,10 @@ Each asset has three sets of metrics:
 - rolling (the last ROLLING_WINDOW_S seconds): VWAP, buy and sell volume, delta,
   trades per second and volume per minute. At startup a separate fetch brings the
   minute before the first live trade, so the window is full within seconds.
+- candles: the session's one-minute candles with the session VWAP at each minute's
+  end, for the page's price chart. They get every trade the session totals get.
+- candle check: each finished minute's candle is compared with Binance's official
+  one, so the numbers are proven right while the app runs (see CandleChecker).
 - volatility (the last VOLATILITY_WINDOW_MIN minutes): the standard deviation of
   one-minute log returns, annualized (x the square root of the minutes in a 365-day
   year, as crypto trades every day) and shown in percent. It uses each finished
@@ -69,6 +73,14 @@ PING_TIMEOUT_S = 5
 # for Binance to answer. A dead network never answers, so this adds to detection time;
 # a live one answers well within it. Worst case to notice a cut: 5 + 5 + 1 = 11 s.
 CLOSE_TIMEOUT_S = 1
+# Each finished minute's candle is checked against Binance's official one. Binance's is
+# final a moment after the minute ends, so checks wait this long, and look every CHECK_POLL_S.
+CHECK_DELAY_S = 10
+CHECK_POLL_S = 5
+# Binance merges fills at one price and taker side within this many ms into one aggregated
+# trade, stamped with its first fill's time. Its candles count each fill in its own minute,
+# so a trade that starts this close to a minute's end can be split across the boundary.
+AGG_WINDOW_MS = 100
 
 YELLOW = "\033[33m"
 RESET_COLOR = "\033[0m"
@@ -102,14 +114,113 @@ def trade_totals(price, quantity, is_buy):
     return (pv, quantity, pv, quantity) if is_buy else (pv, quantity, 0.0, 0.0)
 
 
+class SessionCandles:
+    """The session's one-minute candles (open, high, low, close, volume) for the price chart.
+
+    A trade that arrives late or is fetched after a gap still lands in its own minute:
+    it becomes the open only if it happened earlier than the open, the close only if later.
+    revision goes up whenever a minute before the last two changes (startup fetch, gap,
+    new session), so a chart showing the last two live can tell when to load them all again.
+    """
+
+    def __init__(self):
+        # minute (trade time // MINUTE_MS) -> [open_ms, open, high, low, close_ms, close, pv, volume, close_quantity]
+        # close_quantity is the last trade's size (0 for a fetched candle), for CandleChecker.
+        self.minutes = {}
+        self.previous = {}  # the previous session's minutes, so its last ones can still be checked against Binance
+        self.newest_minute = None
+        self.revision = 0
+        # Running totals, so the state sent every STATE_INTERVAL_S doesn't go through every minute.
+        self.total_pv = self.total_volume = 0.0
+        self.high = self.low = None
+
+    def clear(self):
+        self.previous = self.minutes
+        self.minutes = {}
+        self.newest_minute = None
+        self.revision += 1
+        self.total_pv = self.total_volume = 0.0
+        self.high = self.low = None
+
+    def get(self, minute):
+        """One minute's candle from this session or the previous one, or None (no trades seen in it)."""
+        return self.minutes.get(minute) or self.previous.get(minute)
+
+    def add(self, price, quantity, trade_time_ms):
+        self.merge(trade_time_ms // MINUTE_MS, trade_time_ms, price, price, price,
+                   trade_time_ms, price, price * quantity, quantity, quantity)
+
+    def merge(self, minute, open_ms, open_price, high, low, close_ms, close, pv, volume, close_quantity=0.0):
+        """Add part of a minute (one trade, or a whole fetched candle) to that minute's candle."""
+        candle = self.minutes.get(minute)
+        if candle is None:
+            self.minutes[minute] = [open_ms, open_price, high, low, close_ms, close, pv, volume, close_quantity]
+        else:
+            if open_ms < candle[0]:
+                candle[0], candle[1] = open_ms, open_price
+            candle[2] = max(candle[2], high)
+            candle[3] = min(candle[3], low)
+            if close_ms >= candle[4]:
+                candle[4], candle[5], candle[8] = close_ms, close, close_quantity
+            candle[6] += pv
+            candle[7] += volume
+        self.total_pv += pv
+        self.total_volume += volume
+        self.high = high if self.high is None else max(self.high, high)
+        self.low = low if self.low is None else min(self.low, low)
+        if self.newest_minute is None or minute > self.newest_minute:
+            self.newest_minute = minute
+        elif minute < self.newest_minute - 1:
+            self.revision += 1
+
+    def rows(self):
+        """Every candle, oldest first, as the chart takes them.
+
+        time is the minute's start in seconds; vwap is the session VWAP at the end of that minute.
+        """
+        rows = []
+        pv = volume = 0.0
+        for minute in sorted(self.minutes):
+            _, open_price, high, low, _, close, minute_pv, minute_volume, _ = self.minutes[minute]
+            pv += minute_pv
+            volume += minute_volume
+            rows.append({"time": minute * MINUTE_MS // 1000, "open": open_price, "high": high, "low": low,
+                         "close": close, "vwap": pv / volume})
+        return rows
+
+    def latest_rows(self):
+        """The latest two candles, as rows() gives them, without going through the whole session.
+
+        The VWAP at the end of the newest minute is the running total's; at the end of the
+        one before, it's the running total without the newest minute.
+        """
+        if not self.minutes:
+            return []
+        newest = self.minutes[self.newest_minute]
+        before = [m for m in self.minutes if m < self.newest_minute]
+        latest = [(self.newest_minute, newest, self.total_pv, self.total_volume)]
+        if before:
+            minute = max(before)
+            latest.insert(0, (minute, self.minutes[minute], self.total_pv - newest[6], self.total_volume - newest[7]))
+        return [{"time": minute * MINUTE_MS // 1000, "open": candle[1], "high": candle[2], "low": candle[3],
+                 "close": candle[5], "vwap": pv / volume}
+                for minute, candle, pv, volume in latest]
+
+    def high_low(self):
+        """The session's highest and lowest trade price, or (None, None) before any trade."""
+        return self.high, self.low
+
+
 class SessionTracker:
     """Keeps the running totals for one session and the VWAP derived from them.
 
     cumulative_pv is also the session's volume in USDT. Sell volume isn't kept:
     it's the total minus the buy part (cumulative_pv - buy_pv, and the same in coins).
+    The session's one-minute candles get every trade the totals get.
     """
 
     def __init__(self):
+        self.candles = SessionCandles()
         self.cumulative_pv = 0.0
         self.cumulative_volume = 0.0
         self.buy_pv = 0.0  # USDT volume of trades where the buyer was the taker
@@ -132,10 +243,16 @@ class SessionTracker:
             self.vwap = None
             self.next_reset_ms = next_midnight_ms(trade_time_ms)
             self.open_price = self.open_time_ms = None
+            self.candles.clear()
 
+        self.add_found_trade(price, quantity, trade_time_ms, is_buy)
+        return new_session
+
+    def add_found_trade(self, price, quantity, trade_time_ms, is_buy):
+        """Add a trade known to be in this session (live, late or fetched) to every total and the candles."""
         self.note_price(price, trade_time_ms)
         self.add_totals(*trade_totals(price, quantity, is_buy))
-        return new_session
+        self.candles.add(price, quantity, trade_time_ms)
 
     def note_price(self, price, trade_time_ms):
         """Keep the price of the earliest trade in the session as its opening price."""
@@ -417,8 +534,8 @@ def check_candle(candle):
         raise ValueError(f"kline open or close time isn't a possible time: {candle!r:.200}")
     if not all(is_number(candle[i], 0) for i in (5, 7, 9, 10)):
         raise ValueError(f"kline volume, quote volume or taker buy volumes aren't numbers: {candle!r:.200}")
-    if not all(is_number(candle[i], 0) and float(candle[i]) > 0 for i in (1, 4)):
-        raise ValueError(f"kline open or close isn't a positive price: {candle!r:.200}")
+    if not all(is_number(candle[i], 0) and float(candle[i]) > 0 for i in (1, 2, 3, 4)):
+        raise ValueError(f"kline open, high, low or close isn't a positive price: {candle!r:.200}")
 
 
 def check_list(response, path):
@@ -484,13 +601,15 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
     minute (not including it). aggTrades cover that minute up to, but not including,
     the first live trade.
 
-    Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count, opening).
+    Returns (pv, volume, buy_pv, buy_volume, candle_count, trade_count, opening, chart_parts).
     opening is (price, time_ms) of the session's first trade found (a candle's open is
     its first trade), or None if there were no trades before the first live trade.
+    chart_parts are the arguments of SessionCandles.merge for each fetched candle and trade.
     """
     minute_start_ms = first_trade["T"] - first_trade["T"] % MINUTE_MS
     totals = [0.0, 0.0, 0.0, 0.0]  # pv, volume, buy_pv, buy_volume
     opening = None
+    chart_parts = []
 
     candle_count = 0
     if minute_start_ms > session_start_ms:
@@ -509,8 +628,12 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
                 totals[i] += float(candle[column])
             candle_count += 1
             # A minute with no trades has an open too (the previous close), so skip those.
-            if opening is None and float(candle[5]) > 0:
-                opening = (float(candle[1]), open_time_ms)
+            if float(candle[5]) > 0:
+                if opening is None:
+                    opening = (float(candle[1]), open_time_ms)
+                open_price, high, low, close = (float(candle[i]) for i in (1, 2, 3, 4))
+                chart_parts.append((open_time_ms // MINUTE_MS, open_time_ms, open_price, high, low,
+                                    close_time_ms, close, float(candle[7]), float(candle[5])))
 
     trades = await fetch_trades_before(symbol, minute_start_ms, first_trade, log)
     for price, quantity, time_ms, buy in trades:
@@ -518,7 +641,9 @@ async def fetch_earlier_trades(symbol, session_start_ms, first_trade, log):
             totals[i] += value
         if opening is None:
             opening = (price, time_ms)
-    return *totals, candle_count, len(trades), opening
+        chart_parts.append((time_ms // MINUTE_MS, time_ms, price, price, price, time_ms, price,
+                            price * quantity, quantity, quantity))
+    return *totals, candle_count, len(trades), opening, chart_parts
 
 
 async def backfill(symbol, tracker, first_trade, log):
@@ -530,8 +655,8 @@ async def backfill(symbol, tracker, first_trade, log):
     session_reset_ms = tracker.next_reset_ms
     session_start_ms = session_reset_ms - DAY_MS
     log("info", f"Fetching the session's earlier trades since {format_time(session_start_ms)} UTC")
-    *totals, candle_count, trade_count, opening = await fetch_earlier_trades(symbol, session_start_ms,
-                                                                             first_trade, log)
+    *totals, candle_count, trade_count, opening, chart_parts = await fetch_earlier_trades(
+        symbol, session_start_ms, first_trade, log)
 
     if tracker.next_reset_ms != session_reset_ms:
         log("info", "A new session started before the fetch finished; discarding the fetched trades")
@@ -539,6 +664,10 @@ async def backfill(symbol, tracker, first_trade, log):
     tracker.add_totals(*totals)
     if opening is not None:
         tracker.note_price(*opening)
+    for part in chart_parts:
+        tracker.candles.merge(*part)
+    if chart_parts:
+        tracker.candles.revision += 1  # the chart loads them all again, even ones in the last two minutes
     log("info", f"Added {candle_count} one-minute candles and {trade_count} trades. Session metrics calculated")
 
 
@@ -607,8 +736,7 @@ async def fetch_gap(symbol, tracker, window, closes, checker, first_id, last_id,
             window.add(price, quantity, trade["T"], is_buy(trade))
             closes.add(price, trade["T"])
             if tracker.in_session(trade["T"]):
-                tracker.note_price(price, trade["T"])
-                tracker.add_totals(*trade_totals(price, quantity, is_buy(trade)))
+                tracker.add_found_trade(price, quantity, trade["T"], is_buy(trade))
                 added += 1
             else:
                 dropped += 1
@@ -620,6 +748,140 @@ async def fetch_gap(symbol, tracker, window, closes, checker, first_id, last_id,
                 f"{dropped} from the previous session dropped. Session and rolling window metrics recalculated")
     if never_found:
         log("warning", f"Binance has no trades for {len(never_found)} IDs in that gap")
+
+
+def check_minute(minute, ours, official, spill_in):
+    """Compare our candle for a minute with Binance's official 1m kline row.
+
+    Returns (differences, spill_out); differences is empty if they match. Prices must be
+    equal; volumes are sums of floats, so they only need to agree to 1e-9.
+
+    An aggregated trade has only its first fill's time, but Binance's candle counts each
+    fill in the minute it happened, so the last trade before a boundary can be split
+    across it (see AGG_WINDOW_MS). spill_in is (quantity, price) of the previous
+    minute's last trade that Binance counts in this minute (None if none), spill_out the
+    same for this minute's last trade. A split is only accepted if that trade started
+    within AGG_WINDOW_MS of the boundary, the part is smaller than the trade, and its
+    price accounts for the USDT volume too; the next minute must then open with it.
+    ours is a SessionCandles entry, or None if we saw no trades in that minute.
+    """
+    volume, quote_volume = float(official[5]), float(official[7])
+    if ours is None and spill_in is None:
+        return ([] if volume == 0 else [f"we saw no trades, Binance has volume {official[5]}"]), None
+    if ours is None:  # only the previous minute's split trade
+        quantity, price = spill_in
+        open_price = high = low = close = price
+        our_volume, pv, close_ms, close_quantity = quantity, quantity * price, 0, 0.0
+    else:
+        _, open_price, high, low, close_ms, close, pv, our_volume, close_quantity = ours
+        if spill_in is not None:  # its fills came before any trade of this minute
+            quantity, price = spill_in
+            open_price, high, low = price, max(high, price), min(low, price)
+            our_volume += quantity
+            pv += quantity * price
+
+    spill_out = None
+    excess = our_volume - volume
+    if (1e-9 * max(our_volume, volume) < excess < close_quantity
+            and close_ms >= (minute + 1) * MINUTE_MS - AGG_WINDOW_MS):
+        spill_out = (excess, close)
+        our_volume -= excess
+        pv -= excess * close
+    differences = [f"{name} {mine} vs Binance {theirs}"
+                   for name, mine, theirs in (("open", open_price, official[1]), ("high", high, official[2]),
+                                              ("low", low, official[3]), ("close", close, official[4]))
+                   if mine != float(theirs)]
+    differences += [f"{name} {mine} vs Binance {theirs}"
+                    for name, mine, theirs in (("volume", our_volume, volume), ("USDT volume", pv, quote_volume))
+                    if not math.isclose(mine, theirs, rel_tol=1e-9)]
+    return differences, (None if differences else spill_out)
+
+
+class CandleChecker:
+    """Checks each finished minute's candle against Binance's official 1m candle.
+
+    It proves the numbers are right while the app runs, not just in the backtest. Only
+    minutes built from trades are checked: after the first live trade's minute (the
+    ones before come from Binance's own candles). A minute is checked once it's final
+    on both sides: Binance's candle has had CHECK_DELAY_S to settle, and ours can't
+    still be missing a trade. That needs no IDs missing and a live trade after the
+    minute (IDs are checked up to it, so a dead connection can't hide a trade).
+
+    Each minute passes the part of its last trade that Binance counts in the next one
+    on to it (see check_minute), so checking starts at a boundary no trade can straddle:
+    the first one after the first live trade with no trade in the AGG_WINDOW_MS before it.
+    """
+
+    def __init__(self):
+        self.first_minute = None  # the first live trade's minute; set by that trade
+        self.next_minute = None  # the first minute not checked yet, once a clean start is found
+        self.spill = None  # the part of the last checked minute's last trade counted in the next one
+        self.checked = 0
+        self.matched = 0
+        self.splits = 0  # trades Binance's candles split across a minute boundary
+
+    def snapshot(self):
+        return {"checked": self.checked, "matched": self.matched, "splits": self.splits}
+
+    def last_ready_minute(self, asset):
+        """The last minute that's final on both sides, or None before the first live trade or while incomplete."""
+        if self.first_minute is None or asset.last_trade is None or not asset.is_complete():
+            return None
+        after_last_trade = asset.last_trade["time_ms"] // MINUTE_MS - 1
+        settled = (asset.binance_now_ms() - CHECK_DELAY_S * 1000) // MINUTE_MS - 1
+        return min(after_last_trade, settled)
+
+    def find_start(self, asset, last):
+        """The first minute up to last whose start no trade can straddle, or None if none has come yet."""
+        for minute in range(self.first_minute + 1, last + 1):
+            before = asset.tracker.candles.get(minute - 1)
+            if before is None or before[4] < minute * MINUTE_MS - AGG_WINDOW_MS:
+                return minute
+        return None
+
+    async def check(self, asset, log):
+        """Check every minute that's ready (at most 1000 at a time); returns how many were checked."""
+        last = self.last_ready_minute(asset)
+        if last is None:
+            return 0
+        if self.next_minute is None:
+            self.next_minute = self.find_start(asset, last)
+            if self.next_minute is None:
+                return 0
+        first = self.next_minute
+        last = min(last, first + 999)
+        if last < first:
+            return 0
+        candles = await get_json("/fapi/v1/klines", {
+            "symbol": asset.symbol, "interval": "1m", "limit": 1000,
+            "startTime": first * MINUTE_MS, "endTime": (last + 1) * MINUTE_MS - 1,
+        }, log)
+        check_list(candles, "/fapi/v1/klines")
+        for candle in candles:
+            check_candle(candle)  # every row first, so a bad response counts nothing
+        checked = 0
+        for candle in candles:
+            minute = candle[0] // MINUTE_MS
+            if not first <= minute <= last:
+                continue
+            differences, self.spill = check_minute(minute, asset.tracker.candles.get(minute), candle, self.spill)
+            checked += 1
+            if differences:
+                log("warning", f"Candle {format_time(candle[0])[:5]} UTC doesn't match Binance's: "
+                               + "; ".join(differences))
+            else:
+                self.matched += 1
+                self.splits += self.spill is not None
+        self.checked += checked
+        self.next_minute = last + 1
+        return checked
+
+
+async def check_candles(asset, log):
+    """Check finished minutes against Binance's candles every CHECK_POLL_S, forever."""
+    while True:
+        await asyncio.sleep(CHECK_POLL_S)
+        await asset.candle_checker.check(asset, log)
 
 
 def format_vwap(vwap):
@@ -678,8 +940,10 @@ class AssetTracker:
         self.window = RollingWindow()
         self.closes = MinuteCloses()
         self.checker = TradeIdChecker()
+        self.candle_checker = CandleChecker()
         self.backfill_task = None
         self.fetch_tasks = set()  # keeps running fetch tasks referenced until they finish
+        self.check_tasks = set()  # the candle check, which runs for as long as the program
         self.last_trade = None  # the latest new live trade: price, quantity, time_ms, received_ms
 
     def log(self, level, message):
@@ -748,6 +1012,7 @@ class AssetTracker:
         change_pct = None
         if tracker.open_price is not None and self.last_trade is not None:
             change_pct = (self.last_trade["price"] - tracker.open_price) / tracker.open_price * 100
+        session_high, session_low = tracker.candles.high_low()
         return {
             "symbol": self.symbol,
             "base_asset": self.symbol.removesuffix(QUOTE_ASSET),  # the coin: BTC, ETH, XAU
@@ -759,6 +1024,11 @@ class AssetTracker:
             "last_trade": dict(self.last_trade) if self.last_trade else None,
             "session_open": tracker.open_price,
             "session_change_pct": change_pct,  # how far the last price is from the session's first trade
+            "session_high": session_high,
+            "session_low": session_low,
+            # The latest two candles change live; the chart loads the rest again when the revision changes.
+            "chart": {"revision": tracker.candles.revision, "latest": tracker.candles.latest_rows()},
+            "candle_check": self.candle_checker.snapshot(),
             "vwap": vwap,
             "vwap_distance_pct": distance_pct,  # how far the last price is above (+) or below (-) VWAP
             # delta here is CVD
@@ -767,10 +1037,19 @@ class AssetTracker:
             "volatility": self.volatility_snapshot(),
         }
 
-    def start_task(self, name, function, *args):
+    def chart(self):
+        """Every candle of the session, with the revision they belong to (see SessionCandles)."""
+        return {"symbol": self.symbol, "revision": self.tracker.candles.revision, "candles": self.tracker.candles.rows()}
+
+    def start_task(self, name, function, *args, tasks=None):
+        """Run a fetch (or the never-ending candle check) in the background, started again if it fails.
+
+        It's kept in fetch_tasks unless another set is given: that set is empty once every fetch is done.
+        """
+        tasks = self.fetch_tasks if tasks is None else tasks
         task = asyncio.create_task(retry_on_error(name, self.log, function, *args))
-        self.fetch_tasks.add(task)
-        task.add_done_callback(self.fetch_tasks.discard)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
         return task
 
     def handle_trade(self, trade):
@@ -788,8 +1067,7 @@ class AssetTracker:
             self.window.add(price, quantity, trade_time_ms, buy)
             self.closes.add(price, trade_time_ms)
             if self.tracker.in_session(trade_time_ms):
-                self.tracker.note_price(price, trade_time_ms)
-                self.tracker.add_totals(*trade_totals(price, quantity, buy))
+                self.tracker.add_found_trade(price, quantity, trade_time_ms, buy)
                 self.log("info", f"Late trade {trade['a']} arrived and was added")
             return
 
@@ -809,6 +1087,9 @@ class AssetTracker:
                             self.symbol, self.window, trade, self.log)
             self.start_task(f"Fetching the last {VOLATILITY_WINDOW_MIN} minutes", fill_closes,
                             self.symbol, self.closes, trade, self.log)
+            self.candle_checker.first_minute = trade_time_ms // MINUTE_MS
+            self.start_task("Checking candles against Binance", check_candles, self, self.log,
+                            tasks=self.check_tasks)
         if gap is not None:
             first_id, last_id = gap
             self.log("info", f"Gap: {last_id - first_id + 1} trades missing (IDs {first_id}-{last_id}); fetching from REST")

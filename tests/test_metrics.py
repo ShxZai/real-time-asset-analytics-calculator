@@ -145,7 +145,8 @@ async def play(fake, done, symbols=("XAUUSDT",), **live_settings):
         try:
             await wait_until(lambda: done(live))
         finally:
-            for task in [run_task, *live.fetch_tasks]:
+            check_tasks = [task for asset in live.assets.values() for task in asset.check_tasks]
+            for task in [run_task, *live.fetch_tasks, *check_tasks]:
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await run_task
@@ -364,16 +365,24 @@ def test_startup_fetches_sum_the_session_from_candles_and_fill_the_window_with_t
         return candles if path == "/fapi/v1/klines" else await rest(path, params, log)
 
     monkeypatch.setattr(metrics, "get_json", get_json)
-    result = asyncio.run(metrics.fetch_earlier_trades("XAUUSDT", MIDNIGHT_MS, first_live, lambda *_: None))
+    *result, chart_parts = asyncio.run(metrics.fetch_earlier_trades("XAUUSDT", MIDNIGHT_MS, first_live,
+                                                                     lambda *_: None))
     # pv, volume, buy pv (200 + 300), buy volume (2 + 3), candles, trades, opening (the first candle's
     # open, as it had trades); trade 9 isn't counted twice
-    assert result == (1000, 10, 500, 5, 2, 2, (1, MIDNIGHT_MS))
+    assert result == [1000, 10, 500, 5, 2, 2, (1, MIDNIGHT_MS)]
+    assert len(chart_parts) == 3  # the first candle (the quiet one isn't drawn) and trades 10 and 11
 
     # backfill adds them, and the first candle's open replaces the first live trade as the session's open.
     tracker = metrics.SessionTracker()
     tracker.add_trade(100, 1, first_live["T"], True)
+    revision = tracker.candles.revision
     asyncio.run(metrics.backfill("XAUUSDT", tracker, first_live, lambda *_: None))
     assert (tracker.open_price, tracker.open_time_ms) == (1, MIDNIGHT_MS)
+    # The chart gets the fetched candle and the trades in the live trade's minute, and is told to load again.
+    rows = tracker.candles.rows()
+    assert [row["time"] for row in rows] == [MIDNIGHT_MS // 1000, MIDNIGHT_MS // 1000 + 120]
+    assert rows[1]["open"] == 100 and rows[1]["vwap"] == tracker.vwap
+    assert tracker.candles.revision > revision
 
     # The window gets the trades of the last minute before the first live trade, whichever candle they're in.
     window = metrics.RollingWindow()
@@ -394,6 +403,123 @@ def test_session_open_is_the_earliest_trade_found_and_resets_each_session():
     assert (tracker.open_price, tracker.open_time_ms) == (100, MIDNIGHT_MS + 3_000)
     tracker.add_trade(120, 1, MIDNIGHT_MS + metrics.DAY_MS + 1, True)  # next session
     assert (tracker.open_price, tracker.open_time_ms) == (120, MIDNIGHT_MS + metrics.DAY_MS + 1)
+
+
+def test_candles_take_late_trades_by_trade_time_and_reset_each_session():
+    tracker = metrics.SessionTracker()
+    tracker.add_trade(100, 1, MIDNIGHT_MS + 10_000, True)
+    tracker.add_trade(104, 1, MIDNIGHT_MS + 50_000, True)
+    tracker.add_trade(102, 2, MIDNIGHT_MS + 61_000, False)  # next minute
+    revision = tracker.candles.revision
+    # Late trades in the first minute: an earlier one becomes its open, and the extremes widen.
+    tracker.add_found_trade(99, 1, MIDNIGHT_MS + 5_000, True)
+    tracker.add_found_trade(106, 1, MIDNIGHT_MS + 30_000, True)  # earlier than the close: not the close
+    first, second = tracker.candles.rows()
+    assert (first["open"], first["high"], first["low"], first["close"]) == (99, 106, 99, 104)
+    assert first["vwap"] == (100 + 104 + 99 + 106) / 4  # the session VWAP at that minute's end
+    assert second["time"] - first["time"] == 60 and second["vwap"] == tracker.vwap
+    assert tracker.candles.high_low() == (106, 99)
+    assert tracker.candles.revision == revision  # still one of the latest two minutes
+
+    tracker.add_trade(103, 1, MIDNIGHT_MS + 3 * metrics.MINUTE_MS, True)
+    tracker.add_found_trade(101, 1, MIDNIGHT_MS + 20_000, True)  # older than the latest two: reload
+    assert tracker.candles.revision == revision + 1
+
+    tracker.add_trade(120, 1, MIDNIGHT_MS + metrics.DAY_MS + 1, True)  # next session starts afresh
+    assert [row["close"] for row in tracker.candles.rows()] == [120]
+    assert tracker.candles.revision == revision + 2
+
+
+def test_latest_rows_agree_with_rebuilding_every_row():
+    tracker = metrics.SessionTracker()
+    for i, (price, quantity) in enumerate([(100, 1), (103, 2), (101, 3), (99, 1)]):
+        tracker.add_trade(price, quantity, MIDNIGHT_MS + i * 40_000, i % 2 == 0)
+    tracker.add_found_trade(105, 2, MIDNIGHT_MS + 1_000, True)  # late, into the first minute
+    rows, latest = tracker.candles.rows(), tracker.candles.latest_rows()
+    assert len(latest) == 2
+    for full, fast in zip(rows[-2:], latest):
+        assert full.keys() == fast.keys() and full["time"] == fast["time"]
+        assert all(math.isclose(full[key], fast[key], rel_tol=1e-12) for key in full)
+    assert tracker.candles.high_low() == (105, 99)
+
+
+def official_candle(open_time_ms, open_price, high, low, close, volume, quote_volume):
+    """A 1m kline row as Binance's REST API sends it (numbers as text)."""
+    return [open_time_ms, str(open_price), str(high), str(low), str(close), str(volume),
+            open_time_ms + metrics.MINUTE_MS - 1, str(quote_volume), 1, "0", "0", "0"]
+
+
+def test_check_minute_needs_equal_prices_and_volumes_to_1e_9():
+    ours = [0, 100.0, 103.0, 99.0, 50_000, 101.0, 0.1 + 0.2, 0.3 / 100, 0.001]  # pv and volume as float sums
+    assert metrics.check_minute(0, ours, official_candle(0, 100, 103, 99, 101, 0.003, 0.3), None) == ([], None)
+    differences, spill = metrics.check_minute(0, ours, official_candle(0, 100, 103.5, 99, 101, 0.004, 0.3), None)
+    assert [d.split()[0] for d in differences] == ["high", "volume"] and spill is None
+    # A quiet minute matches only if Binance had no trades in it either.
+    assert metrics.check_minute(0, None, official_candle(0, 1, 1, 1, 1, 0, 0), None) == ([], None)
+    assert metrics.check_minute(0, None, official_candle(0, 1, 1, 1, 1, 2, 2), None)[0] != []
+
+
+def test_a_trade_split_across_a_minute_boundary_matches_only_if_the_next_minute_has_the_rest():
+    m0 = MIDNIGHT_MS
+    tracker = metrics.SessionTracker()
+    tracker.add_trade(100, 1, m0 + 1_000, True)
+    tracker.add_trade(105, 3, m0 + metrics.MINUTE_MS - 50, True)  # 3 fills from 50 ms before the boundary...
+    tracker.add_trade(103, 1, m0 + metrics.MINUTE_MS + 20_000, True)
+    first, second = m0 // metrics.MINUTE_MS, m0 // metrics.MINUTE_MS + 1
+    # ...of which Binance counts 1 in the first minute and 2 in the second, where they come first.
+    differences, spill = metrics.check_minute(first, tracker.candles.get(first),
+                                              official_candle(m0, 100, 105, 100, 105, 2, 205), None)
+    assert differences == [] and spill == (2, 105)
+    second_official = official_candle(m0 + metrics.MINUTE_MS, 105, 105, 103, 103, 3, 313)
+    assert metrics.check_minute(second, tracker.candles.get(second), second_official, spill) == ([], None)
+    # If the second minute doesn't open with the rest of that trade, the split was something else.
+    wrong_open = official_candle(m0 + metrics.MINUTE_MS, 103, 105, 103, 103, 3, 313)
+    assert metrics.check_minute(second, tracker.candles.get(second), wrong_open, spill)[0] == ["open 105 vs Binance 103"]
+    # A trade can't lose more than its own size, nor be split if it started over AGG_WINDOW_MS before the boundary.
+    assert metrics.check_minute(first, tracker.candles.get(first),
+                                official_candle(m0, 100, 105, 100, 105, 0.5, 0.5 * 205), None)[1] is None
+    tracker.add_trade(104, 1, m0 + 2 * metrics.MINUTE_MS - metrics.AGG_WINDOW_MS - 1, True)
+    late = official_candle(m0 + metrics.MINUTE_MS, 105, 105, 103, 104, 3.5, 313 + 52)
+    assert metrics.check_minute(second, tracker.candles.get(second), late, spill)[1] is None
+
+
+def test_candle_check_waits_until_a_minute_is_final_then_counts_matches(monkeypatch):
+    asset = metrics.AssetTracker("XAUUSDT")
+    official = {}
+
+    async def get_json(path, params, log):
+        return [official[t] for t in range(params["startTime"], params["endTime"], metrics.MINUTE_MS) if t in official]
+
+    monkeypatch.setattr(metrics, "get_json", get_json)
+    monkeypatch.setattr(asset, "is_complete", lambda: True)
+    logged = []
+    log = lambda *event: logged.append(event)
+
+    def live_trade(trade_id, price, time_ms):
+        asset.tracker.add_trade(price, 1, time_ms, True)
+        asset.last_trade = {"price": price, "quantity": 1, "time_ms": time_ms, "received_ms": metrics.now_ms()}
+        asset.checker.check(trade_id)
+
+    m0 = MIDNIGHT_MS
+    asset.candle_checker.first_minute = m0 // metrics.MINUTE_MS - 1  # a quiet minute, so checking starts at m0
+    live_trade(1, 100, m0 + 1_000)
+    live_trade(2, 102, m0 + 30_000)
+    official[m0] = official_candle(m0, 100, 102, 100, 102, 2, 202)
+    official[m0 + metrics.MINUTE_MS] = official_candle(m0 + metrics.MINUTE_MS, 101, 101, 101, 101, 1, 101)
+    assert asyncio.run(asset.candle_checker.check(asset, log)) == 0  # no trade after the minute yet
+
+    live_trade(3, 101, m0 + metrics.MINUTE_MS + 5_000)
+    assert asyncio.run(asset.candle_checker.check(asset, log)) == 0  # Binance's candle hasn't settled yet
+    live_trade(4, 101, m0 + metrics.MINUTE_MS + metrics.CHECK_DELAY_S * 1000 + 1)
+    assert asyncio.run(asset.candle_checker.check(asset, log)) == 1
+    assert asset.candle_checker.snapshot() == {"checked": 1, "matched": 1, "splits": 0}
+
+    # A minute that differs is counted and reported, and isn't checked twice.
+    live_trade(5, 104, m0 + 2 * metrics.MINUTE_MS + metrics.CHECK_DELAY_S * 1000 + 1)
+    assert asyncio.run(asset.candle_checker.check(asset, log)) == 1
+    assert asset.candle_checker.snapshot() == {"checked": 2, "matched": 1, "splits": 0}
+    assert logged[-1][0] == "warning" and "00:01 UTC doesn't match" in logged[-1][1] and "volume" in logged[-1][1]
+    assert asyncio.run(asset.candle_checker.check(asset, log)) == 0
 
 
 def test_realized_volatility_is_the_annualized_sample_deviation_of_log_returns():

@@ -125,6 +125,28 @@ def test_state_feed_sends_every_asset_in_one_message_without_events():
     asyncio.run(scenario())
 
 
+def test_candles_endpoint_returns_the_session_and_state_carries_the_latest_two():
+    async def scenario():
+        live = metrics.LiveFeed(["XAUUSDT"])
+        xau = live.assets["XAUUSDT"]
+        midnight = metrics.next_midnight_ms(0)
+        for minute in range(3):
+            xau.tracker.add_trade(100 + minute, 1, midnight + minute * metrics.MINUTE_MS, True)
+        async with running_server(live) as address:
+            status, chart = await get(f"http://{address}/candles/XAUUSDT")
+            assert status == 200 and chart["symbol"] == "XAUUSDT"
+            assert [candle["close"] for candle in chart["candles"]] == [100, 101, 102]
+            assert (await get(f"http://{address}/candles/NOPE"))[0] == 404
+
+            async with websockets.connect(f"ws://{address}/ws/state") as ws:
+                state_chart = (await receive(ws))["assets"][0]["chart"]
+                assert state_chart["revision"] == chart["revision"]
+                assert [row["close"] for row in state_chart["latest"]] == [101, 102]
+                assert state_chart["latest"][-1]["vwap"] == pytest.approx(chart["candles"][-1]["vwap"])
+
+    asyncio.run(scenario())
+
+
 def test_bind_first_free_skips_ports_in_use():
     taken = server.bind_first_free(range(20000, 20100))
     taken_port = taken.getsockname()[1]
@@ -197,7 +219,7 @@ def test_page_is_served():
                 with urllib.request.urlopen(f"http://{address}{path}", timeout=5) as response:
                     return response.status, response.read().decode()
             status, html = await asyncio.to_thread(fetch, "/")
-            assert status == 200 and "/static/app.js" in html
+            assert status == 200 and "/static/app.js" in html and "lightweight-charts" in html
             status, script = await asyncio.to_thread(fetch, "/static/app.js")
             assert status == 200 and "/ws/state" in script
 

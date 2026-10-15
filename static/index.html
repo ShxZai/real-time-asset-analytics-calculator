@@ -54,7 +54,7 @@
     /* Each width fits the longest value the column can show (cell padding is the 24px). The page font is
        monospace, so every digit is the same width and a value's width depends only on its length. */
     table { table-layout: fixed; }
-    col.w-symbol { width: calc(8ch + 24px); }   /* BTCUSDT */
+    col.w-symbol { width: calc(10ch + 24px); }  /* ▸ BTCUSDT */
     col.w-price { width: calc(10ch + 24px); }   /* 123456.78 */
     col.w-age { width: calc(10ch + 24px); }     /* 999 s ago */
     col.w-pct { width: calc(8ch + 24px); }      /* +10.00% */
@@ -83,16 +83,40 @@
     .switch button[aria-pressed="true"] { background: var(--line); color: var(--text); }
     .switch button:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
 
-    .legend { color: var(--muted); margin: 8px 0 16px; }
+    .legend { color: var(--muted); margin: 12px 0 0; }
     .legend .swatch { color: var(--yellow); }
 
-    details { background: var(--panel); border: 1px solid var(--line); }
+    details { background: var(--panel); border: 1px solid var(--line); margin-top: 16px; }
     summary { padding: 8px 12px; cursor: pointer; color: var(--muted); }
     #console { max-height: 320px; overflow-y: auto; margin: 0; padding: 0 12px 8px; list-style: none; }
     #console li { padding: 2px 0; white-space: pre-wrap; word-break: break-word; }
     #console .time { color: var(--muted); }
     #console .source { color: var(--blue); }
     #console .warning { color: var(--yellow); }
+
+    /* An asset row opens its chart and details underneath when clicked. */
+    tr.asset { cursor: pointer; }
+    tr.asset:hover td { background: #1a1e24; }
+    tr.asset:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+    tr.asset .arrow { color: var(--muted); }
+    tr.detail > td { padding: 12px; text-align: left; white-space: normal; background: var(--bg); }
+    /* Kept as wide as the visible part of the table (app.js sets the width) and pinned to its left edge,
+       so the chart and numbers stay in view when the table is scrolled sideways. */
+    .detail-body { position: sticky; left: 12px; display: flex; flex-wrap: wrap; gap: 16px; }
+    .chart-box { flex: 1 1 600px; min-width: 0; }
+    .chart { height: 360px; }
+    /* The chart library lays itself out with a table of its own; keep the page's table styles off it. */
+    .chart table { width: auto; table-layout: auto; background: none; border-collapse: separate; border-spacing: 0; }
+    .chart td { padding: 0; border: 0; text-align: left; white-space: normal; }
+    .chart-note { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .chart-note .vwap-key { color: var(--blue); }
+    .stats { flex: 0 0 280px; margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; align-content: start; }
+    .stats dt { color: var(--muted); }
+    .stats dd { margin: 0; text-align: right; }
+    .stats dd .sub { display: block; font-size: 12px; opacity: 0.65; }
+    .stats dd.up { color: var(--green); }
+    .stats dd.down { color: var(--red); }
+    .stats dd.gap { color: var(--yellow); }
   </style>
 </head>
 <body>
@@ -100,6 +124,8 @@
     <h1>ASSET ANALYTICS</h1>
     <span id="app-status" class="status">App: connecting</span>
     <span id="binance-status" class="status">Binance: -</span>
+    <span id="check-status" class="status"
+          title="Every finished minute's candle (open, high, low, close, volume) built from the live trades is compared with Binance's official one">Checked vs Binance: -</span>
   </header>
 
   <div class="toolbar">
@@ -110,7 +136,7 @@
     </span>
   </div>
 
-  <div class="table-wrap">
+  <div id="table-wrap" class="table-wrap">
     <table>
       <!-- Fixed widths, so a number getting longer never moves the columns. -->
       <colgroup>
@@ -137,23 +163,19 @@
       <tbody id="assets"></tbody> <!-- one row per asset, added by app.js -->
     </table>
   </div>
-  <p class="legend">
-    Volumes are shown in USDT (price &times; quantity) and in the coin itself (BTC, ETH, XAU = troy ounces of gold);
-    the switch above picks which is large. A buy is a trade where the buyer took a seller's resting order, a sell
-    the other way round; delta is buy volume minus sell volume (over the session: CVD).
-    Trades/s counts Binance's aggregated trades (one per taker order and price).
-    Change: the price now against the session's first trade after 00:00 UTC.
-    Volatility: how much the price swings, as the standard deviation of the last 60 one-minute returns
-    scaled to a year (&times; &radic;525,600 minutes, as these markets trade every day); it updates once a minute.<br>
-    <span class="swatch">Yellow numbers</span>: some trades are still being fetched after a gap; usable but not final.
-    Grey numbers: not live (reconnecting, or the app is unreachable).
-  </p>
-
   <details>
     <summary>Debug console (<span id="event-count">0</span> events)<span id="console-status"></span></summary>
     <ol id="console"></ol>
   </details>
+  <p class="legend">
+    Click a row for its chart and details. Volumes show USDT and the coin; the switch picks which is large.
+    <span class="swatch">Yellow</span>: trades still being fetched after a gap, not final.
+    Grey: not live (reconnecting, or the app is unreachable).
+    Checked vs Binance: each finished minute's candle is compared with Binance's official one; mismatches go to the debug console.
+  </p>
 
+  <!-- TradingView's open-source chart library; the page feeds it the engine's own candles and VWAP. -->
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

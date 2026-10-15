@@ -9,6 +9,8 @@
 //
 // Every volume comes in USDT ("quote") and in the coin itself ("base"). A volume cell
 // shows one large and the other small underneath; the unit switch swaps them.
+//
+// Clicking an asset's row opens its price chart (Lightweight Charts) and more numbers underneath.
 
 const RECONNECT_WAITS_MS = [1000, 2000, 4000, 5000]; // then 5 s each time
 const MAX_CONSOLE_ROWS = 500; // same as the engine keeps
@@ -89,6 +91,17 @@ function render() {
               cantReach ? "bad" : "warn");
   }
 
+  // Candle check, summed over every asset.
+  const checked = state.assets.reduce((sum, asset) => sum + asset.candle_check.checked, 0);
+  const matched = state.assets.reduce((sum, asset) => sum + asset.candle_check.matched, 0);
+  if (checked === 0) {
+    setStatus(el("check-status"), "Checked vs Binance: first minute pending", null);
+  } else if (matched === checked) {
+    setStatus(el("check-status"), `Checked vs Binance: ${checked.toLocaleString("en-US")}/${checked.toLocaleString("en-US")} minutes match`, "ok");
+  } else {
+    setStatus(el("check-status"), `Checked vs Binance: ${(checked - matched).toLocaleString("en-US")} of ${checked.toLocaleString("en-US")} minutes differ`, "bad");
+  }
+
   // Numbers are frozen (grey) whenever Binance or the app isn't connected.
   const live = stateOpen && connection.state === "connected";
   for (const asset of state.assets) renderAsset(asset, live);
@@ -115,7 +128,20 @@ function rowFor(symbol) {
       // last 60 min
       volatility: cell(),
     };
-    cells.symbol.textContent = symbol;
+    cells.arrow = document.createElement("span");
+    cells.arrow.className = "arrow";
+    cells.arrow.textContent = "▸ ";
+    cells.symbol.replaceChildren(cells.arrow, symbol);
+    row.className = "asset";
+    row.tabIndex = 0;
+    row.setAttribute("aria-expanded", "false");
+    row.addEventListener("click", () => toggleDetail(symbol));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        toggleDetail(symbol);
+      }
+    });
     cells.change.classList.add("start");
     cells.rollingVwap.classList.add("start");
     cells.volatility.classList.add("start");
@@ -235,6 +261,205 @@ function renderAsset(asset, live) {
   } else {
     setCell(cells.volatility, volatility.annualized_pct.toFixed(1) + "%", { gap });
   }
+
+  if (detail && detail.symbol === asset.symbol) renderDetail(asset);
+}
+
+// ---- Detail panel (price chart and more numbers under a clicked row) ----
+//
+// One panel is open at a time. It loads the session's candles from /candles/{symbol},
+// then keeps the latest two up to date from each state message. When the state's chart
+// revision differs from the loaded one (startup fetch, gap filled, new session), it
+// loads them all again.
+
+const CHART_RETRY_MS = 2000;
+let detail = null; // the open panel: { symbol, row, chart, candles, vwapLine, stats, revision, ... }
+
+function toggleDetail(symbol) {
+  const wasOpen = detail && detail.symbol === symbol;
+  closeDetail();
+  if (!wasOpen) openDetail(symbol);
+  render();
+}
+
+function closeDetail() {
+  if (!detail) return;
+  if (detail.chart) detail.chart.remove();
+  detail.row.remove();
+  const cells = rows.get(detail.symbol);
+  cells.row.setAttribute("aria-expanded", "false");
+  setText(cells.arrow, "▸ ");
+  detail = null;
+}
+
+function cssColor(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function openDetail(symbol) {
+  const cells = rows.get(symbol);
+  cells.row.setAttribute("aria-expanded", "true");
+  setText(cells.arrow, "▾ ");
+
+  const row = document.createElement("tr");
+  row.className = "detail";
+  const td = document.createElement("td");
+  td.colSpan = cells.row.children.length;
+  const body = document.createElement("div");
+  body.className = "detail-body";
+  const chartBox = document.createElement("div");
+  chartBox.className = "chart-box";
+  const chartElement = document.createElement("div");
+  chartElement.className = "chart";
+  const note = document.createElement("div");
+  note.className = "chart-note";
+  note.innerHTML = 'One-minute candles since 00:00 UTC (times in UTC), <span class="vwap-key">session VWAP</span> as a line.';
+  chartBox.append(chartElement, note);
+
+  const statList = document.createElement("dl");
+  statList.className = "stats";
+  const stats = {};
+  for (const [key, label] of [["open", "Session open"], ["high", "High"], ["low", "Low"], ["range", "Range"],
+                              ["volume", "Volume"], ["buyShare", "Buy share"], ["trades", "Trades (last 60 s)"],
+                              ["check", "Minutes vs Binance"]]) {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    stats[key] = document.createElement("dd");
+    stats[key].textContent = "-";
+    statList.append(dt, stats[key]);
+  }
+  body.append(chartBox, statList);
+  td.append(body);
+  row.append(td);
+  cells.row.after(row);
+
+  detail = { symbol, row, body, stats, chart: null, revision: null, loading: false, nextLoadAt: 0, lastTime: null };
+  if (typeof LightweightCharts === "undefined") {
+    chartElement.textContent = "The chart library couldn't load (it comes from cdn.jsdelivr.net).";
+    chartElement.classList.add("placeholder");
+    return;
+  }
+  const chart = LightweightCharts.createChart(chartElement, {
+    autoSize: true,
+    layout: { background: { type: "solid", color: cssColor("--bg") }, textColor: cssColor("--muted"),
+              fontFamily: getComputedStyle(document.body).fontFamily },
+    grid: { vertLines: { color: cssColor("--line") }, horzLines: { color: cssColor("--line") } },
+    rightPriceScale: { borderColor: cssColor("--line") },
+    timeScale: { borderColor: cssColor("--line"), timeVisible: true, secondsVisible: false },
+  });
+  const green = cssColor("--green");
+  const red = cssColor("--red");
+  detail.chart = chart;
+  detail.candles = chart.addCandlestickSeries({
+    upColor: green, downColor: red, wickUpColor: green, wickDownColor: red, borderVisible: false,
+    priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+  });
+  detail.vwapLine = chart.addLineSeries({
+    color: cssColor("--blue"), lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false,
+    priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+  });
+}
+
+function toBars(rows) {
+  return {
+    candles: rows.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })),
+    vwap: rows.map(({ time, vwap }) => ({ time, value: vwap })),
+  };
+}
+
+async function loadCandles(panel) {
+  panel.loading = true;
+  try {
+    const response = await fetch(`/candles/${encodeURIComponent(panel.symbol)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (detail !== panel) return; // closed while loading
+    const bars = toBars(data.candles);
+    panel.candles.setData(bars.candles);
+    panel.vwapLine.setData(bars.vwap);
+    if (panel.revision === null) panel.chart.timeScale().fitContent(); // first load: show the whole session
+    panel.revision = data.revision;
+    panel.lastTime = data.candles.length ? data.candles[data.candles.length - 1].time : null;
+  } catch {
+    panel.nextLoadAt = Date.now() + CHART_RETRY_MS; // the server is unreachable; try again shortly
+  } finally {
+    panel.loading = false;
+  }
+}
+
+function setStat(element, text, { sub = null, sign = 0, gap = false } = {}) {
+  if (sub === null) {
+    setText(element, text);
+  } else {
+    let main = element.querySelector(".main");
+    let small = element.querySelector(".sub");
+    if (!main) {
+      main = document.createElement("span");
+      main.className = "main";
+      small = document.createElement("span");
+      small.className = "sub";
+      element.replaceChildren(main, small);
+    }
+    setText(main, text);
+    setText(small, sub);
+  }
+  setClass(element, "up", sign > 0);
+  setClass(element, "down", sign < 0);
+  setClass(element, "gap", gap);
+}
+
+function renderDetail(asset) {
+  const panel = detail;
+  // As wide as the visible part of the table (minus the cell's padding), however wide the table is.
+  const width = `${el("table-wrap").clientWidth - 24}px`;
+  if (panel.body.style.width !== width) panel.body.style.width = width;
+  if (panel.chart && !panel.loading) {
+    const chart = asset.chart;
+    if (chart.revision !== panel.revision) {
+      if (Date.now() >= panel.nextLoadAt) loadCandles(panel);
+    } else {
+      // The latest two candles change live; update() only takes the last bar or a newer one.
+      const bars = toBars(chart.latest.filter((row) => panel.lastTime === null || row.time >= panel.lastTime));
+      try {
+        bars.candles.forEach((bar) => panel.candles.update(bar));
+        bars.vwap.forEach((point) => panel.vwapLine.update(point));
+        if (bars.candles.length) panel.lastTime = bars.candles[bars.candles.length - 1].time;
+      } catch {
+        panel.revision = -1; // out of step with the server: load every candle again (keeping the zoom)
+      }
+    }
+  }
+
+  // Session numbers follow the table: not shown until the startup fetch has added the earlier trades.
+  const s = panel.stats;
+  const gap = !asset.complete;
+  if (asset.history !== "done" || asset.session_open === null || asset.session_high === null) {
+    const text = { waiting: "Waiting", fetching: "Fetching data" }[asset.history] || "-";
+    for (const key of ["open", "high", "low", "range", "volume", "buyShare"]) setStat(s[key], text);
+  } else {
+    const open = asset.session_open;
+    setStat(s.open, open.toFixed(2), { gap });
+    setStat(s.high, asset.session_high.toFixed(2), { gap });
+    setStat(s.low, asset.session_low.toFixed(2), { gap });
+    setStat(s.range, ((asset.session_high - asset.session_low) / open * 100).toFixed(2) + "%", { gap });
+    const flow = asset.flow;
+    const otherUnit = mainUnit === "quote" ? "base" : "quote";
+    const total = (unit) => flow[unit].buy + flow[unit].sell;
+    const volumeText = {
+      quote: `${formatUsdt(total("quote"))} ${asset.quote_asset}`,
+      base: `${formatCoins(total("base"))} ${asset.base_asset}`,
+    };
+    setStat(s.volume, volumeText[mainUnit], { sub: volumeText[otherUnit], gap });
+    // Share of the session's USDT volume where the buyer was the taker: above 50% means buyers pushed harder.
+    const share = total("quote") > 0 ? flow.quote.buy / total("quote") * 100 : 50;
+    setStat(s.buyShare, share.toFixed(1) + "%", { sign: share - 50, gap });
+  }
+  const rolling = asset.rolling;
+  setStat(s.trades, rolling && rolling.warmup_s === 0 ? String(Math.round(rolling.trades_per_s * 60)) : "-",
+          { gap });
+  const check = asset.candle_check;
+  setStat(s.check, check.checked === 0 ? "pending" : `${check.matched}/${check.checked} match`,
+          { sign: check.checked === 0 ? 0 : check.matched === check.checked ? 1 : -1 });
 }
 
 // ---- Events (debug console) ----

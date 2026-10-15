@@ -11,6 +11,10 @@ every open page shares one Binance connection. A page opens two WebSockets:
 - /ws/events: the latest events of every log first (history), then each new event
   as it happens. The page rebuilds its console from the history on every connect.
 
+GET /candles/{symbol} returns the session's one-minute candles for an asset's price
+chart. The state message carries only the latest two (the ones still changing) and a
+revision that changes when any older one does, so the page knows when to load them again.
+
 Each asset and the system have their own event log with their own IDs, so an event
 is named by (symbol, id). GET /events/{symbol}/{id} returns one event that's still
 kept ("system" for the system log), so a page can fetch an ID it didn't receive.
@@ -111,6 +115,13 @@ def create_app(live, run_engine=True):
         if event is None:
             raise HTTPException(404, f"Event {symbol}/{event_id} isn't kept (only the latest {log.events.maxlen} are)")
         return event
+
+    @app.get("/candles/{symbol}")
+    async def get_candles(symbol: str):
+        asset = live.assets.get(symbol)
+        if asset is None:
+            raise HTTPException(404, f"{symbol} isn't tracked")
+        return asset.chart()
 
     @app.websocket("/ws/state")
     async def state_feed(ws: WebSocket):
